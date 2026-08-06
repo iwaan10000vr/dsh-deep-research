@@ -18,5 +18,10 @@
   "license": "MIT",
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "^0.0.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
   }
 }

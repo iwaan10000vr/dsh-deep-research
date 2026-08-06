@@ -22,23 +22,27 @@
 
 ```
 dsh-deep-research/
-├── package.json    # @dsh-external/dsh-deep-research
+├── package.json    # @dsh-external/dsh-deep-research（声明 dsh.bundle.patch）
+├── cordis.patch.yml  # bundle 补丁：按包名插入插件行
 ├── lib/index.js    # cordis 插件：注册 deep_research 工具，提交官方 workflow 脚本
 └── README.md
 ```
 
-## 安装（挂载）
+## 安装（新版 profile 插件机制）
 
-`~/.dsh/config.yaml` 追加（已挂载）：
+包声明了 `dsh.bundle.patch`（cordis.patch.yml），通过 `dsh plugin` 装进任意 profile：
 
-```yaml
-- insert:
-    - id: dsh-deep-research
-      name: /mnt/d/coding/deepseekharness/plugins/dsh-deep-research/lib/index.js
+```bash
+dsh plugin --profile tui add git+https://github.com/dsh-external/dsh-deep-research.git
 ```
 
-重启 `dsh` 生效。绝对路径加载，不需要 pnpm link，不触碰源码 checkout。
-卸载：删除上述 insert 块即可。
+重启 `dsh --profile tui` 生效：插件按包名加载，工具 `deep_research` 随 profile 注入。
+> 若 pnpm 把 https URL 重写成 git+ssh（本机全局 git `insteadof` 配置所致），用上面的
+> `git+https://` 形式；`dsh plugin` 会提示需要 `allowBuilds` 时按提示在
+> `$DSH_HOME/profiles/<name>/pnpm-workspace.yaml` 加一行即可。
+
+卸载：`dsh plugin --profile tui remove @dsh-external/dsh-deep-research`（或从 profile 的
+`package.json` 移除依赖并 `dsh plugin --profile tui update`）。
 
 ## 工具参数
 

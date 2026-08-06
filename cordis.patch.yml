@@ -1,0 +1,8 @@
+# dsh-deep-research profile bundle patch (declared by the `dsh.bundle.patch`
+# manifest field): inserts the deep_research orchestrator row into any profile
+# that lists @dsh-external/dsh-deep-research in its `dsh.profile.bundles`.
+# The row loads the plugin by package name from the profile's node_modules.
+
+- insert:
+    - id: dsh-deep-research
+      name: '@dsh-external/dsh-deep-research'
