@@ -42,21 +42,43 @@ node_modules 内的文件）；源码 checkout 在 node_modules 外直跑时也�
 原生剥离。要求 erasable-only TS 语法（无 enum/命名空间等），
 `node --test`/`pnpm typecheck` 会挡住不可移植写法。
 
-## 安装（新版 profile 插件机制）
+## 安装与使用方式
 
-包声明了 `dsh.bundle.patch`（cordis.patch.yml），通过 `dsh plugin` 装进任意 profile：
+包声明了 `dsh.bundle.patch`（cordis.patch.yml），通过 `dsh plugin` 装进**任意** profile
+（把 `<profile>` 换成 `tui` / `headless` / `web` 或自建 profile）：
 
 ```bash
-dsh plugin --profile tui add git+https://github.com/dsh-external/dsh-deep-research.git
+dsh plugin --profile <profile> add git+https://github.com/dsh-external/dsh-deep-research.git
+dsh --profile <profile>        # 重启生效：工具 deep_research 随 profile 注入
 ```
 
-重启 `dsh --profile tui` 生效：插件按包名加载，工具 `deep_research` 随 profile 注入。
 > 若 pnpm 把 https URL 重写成 git+ssh（本机全局 git `insteadof` 配置所致），用上面的
 > `git+https://` 形式；`dsh plugin` 会提示需要 `allowBuilds` 时按提示在
 > `$DSH_HOME/profiles/<name>/pnpm-workspace.yaml` 加一行即可。
 
-卸载：`dsh plugin --profile tui remove @dsh-external/dsh-deep-research`（或从 profile 的
-`package.json` 移除依赖并 `dsh plugin --profile tui update`）。
+工具由模型按工具描述自动触发（深度研究/调研/多源信息综合分析/研究报告/文献搜集），
+对话中直接说人话即可：
+
+- 「深度调研一下 MCP 生态现状，重点对比几家主流实现，出一份带引用的报告」
+- 「按这份问题清单做研究：1. ... 2. ...」（已有清单 → 跳过自动拆解，直接并行研究）
+- 「调研一下 A/B 方案，purpose 是决定我们选哪个」（用途越明确，答案空间越准）
+- 复杂主题会自动扩展轮次（自适应闭环），简单主题一轮收敛；想要更严谨传 `depth: 3`，
+  要引用纠错和覆盖度审计传 `review: true`。
+
+**成本建议**：模型分层——规划/综合用强模型、研究用便宜模型（配置
+`plannerModel`/`researcherModel`/`synthesizerModel`/`reviewerModel`），可显著降本。
+
+**依赖要求**：profile 的组合必须包含官方 workflow 引擎与内置 web 工具——`dsh` 官方
+base 组合自带，无需额外安装；peer 依赖（`@deepseek-ai/dsh-tools` 等）由组合提供，
+profile 的 `autoInstallPeers: false` 可避免向 registry 查找未发布的 `@deepseek-ai/*`。
+
+**更新 / 卸载**：
+
+```bash
+dsh plugin --profile <profile> update
+dsh plugin --profile <profile> remove @dsh-external/dsh-deep-research
+# 或：从 profile 的 package.json 移除依赖后 dsh plugin --profile <profile> update
+```
 
 ## 工具参数
 
