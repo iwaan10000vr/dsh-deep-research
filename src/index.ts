@@ -49,9 +49,12 @@
  * the parent route. The plugin never fetches the web: search/fetch stays on
  * DSH's built-in `web_search` / `web_fetch`, which children inherit.
  *
- * Native TypeScript source: the package entry points at this file and the
- * runtime loads it through Node's native type stripping (>=22.18/24) or the
- * dsh source launcher's tsx hook — no build step.
+ * Native TypeScript source: the package entry points at this file and no build
+ * step exists. In a dsh profile the package lives under node_modules, so it
+ * loads through the dsh source launcher's whole-process tsx hook (Node's
+ * native type stripping refuses files under node_modules); a checkout run
+ * outside node_modules can also load via Node >=22.18 native stripping.
+ * Syntax must stay erasable-only (no enums/namespaces/parameter properties).
  *
  * @module @dsh-external/dsh-deep-research
  */
@@ -231,8 +234,9 @@ if (!subs) {
   planText = '研究答案空间：' + (planned.scope || '（未声明）')
     + '\n覆盖维度：' + (dims.length > 0 ? dims.join('、') : '（未声明）')
     + (gaps.length > 0 ? '\n规划假设的盲区（待验证）：' + gaps.join('、') : '')
-  // 规划的盲区作为假设进入第一轮后的侦察队列。
-  subs = subs.concat(gaps.slice(0, maxParallel).map((g) => ({ question: g, dimension: '盲区侦察', blind: true })))
+  // 规划的盲区作为假设进入研究队列（超出 maxParallel 的部分留在队列里，
+  // 由后续轮次处理，绝不静默丢弃）。
+  subs = subs.concat(gaps.map((g) => ({ question: g, dimension: '盲区侦察', blind: true })))
 }
 
 phase('研究')
@@ -301,7 +305,9 @@ while (pending.length > 0 && round < depth + 1) {
       leads.push({ question: g.aspect, followUp: true })
     }
   }
-  pending = leads
+  pending = [...pending.slice(maxParallel), ...leads]
+  // 队列语义：本轮未处理的子问题（超出 maxParallel 的部分）留在队首，
+  // 下一轮继续研究；high-priority 缺口作为补充问题排在它们之后。
   // 边际信息增益收敛：本轮没有产出任何新的 high-priority 缺口 → 循环自然结束。
 }
 
@@ -383,7 +389,9 @@ export function apply(ctx: Context, config: Config = {}) {
   const researcherModel = config.researcherModel ?? undefined
   const synthesizerModel = config.synthesizerModel ?? undefined
   const reviewerModel = config.reviewerModel ?? synthesizerModel
-  const maxTotalAgents = config.maxTotalAgents === undefined
+  // null/undefined both mean "leave the engine default" (old JS contract:
+  // positiveInt(..., undefined, ...) omitted the key — keep it omitted).
+  const maxTotalAgents = config.maxTotalAgents === undefined || config.maxTotalAgents === null
     ? undefined
     : positiveInt(config.maxTotalAgents, 0, 'maxTotalAgents')
   const maxParallel = config.maxParallel === undefined

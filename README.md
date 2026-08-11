@@ -36,8 +36,10 @@ pnpm install        # 仅 typescript/@types/node（typecheck 用）
 pnpm run typecheck  # tsc -b，类型从 sibling deepseek-harness checkout 解析
 ```
 
-源码即运行时：包入口直接指向 `src/index.ts`，无构建步骤——dsh 源码启动器（tsx hook）
-或 Node ≥22.18 原生类型剥离直接加载。要求 erasable-only TS 语法（无 enum/命名空间等），
+源码即运行时：包入口直接指向 `src/index.ts`，无构建步骤。profile 安装的副本位于
+node_modules 下，由 dsh 源码启动器的 tsx hook 加载（Node 原生类型剥离拒绝
+node_modules 内的文件）；源码 checkout 在 node_modules 外直跑时也可用 Node ≥22.18
+原生剥离。要求 erasable-only TS 语法（无 enum/命名空间等），
 `node --test`/`pnpm typecheck` 会挡住不可移植写法。
 
 ## 安装（新版 profile 插件机制）

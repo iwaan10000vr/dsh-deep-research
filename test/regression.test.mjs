@@ -23,7 +23,8 @@
  *   ③ 规划路径：无 questions 时先规划，盲区假设进入侦察队列
  *   ④ 工具注册：deep_research 注册、输出 schema 在引擎受支持子集内
  *   ⑤ 参数校验：空 topic / depth>3 抛错；questions 解析为数组透传；
- *      models / maxParallel 默认值透传
+ *      models / maxParallel 默认值透传；maxTotalAgents null 不写入请求
+ *   ⑥ 队列语义：子问题超过 maxParallel 时跨轮续研，绝不静默丢弃
  */
 
 import assert from 'node:assert/strict'
@@ -557,4 +558,48 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflows.start'
   assert.strictEqual(req2.args.maxParallel, 2)
   assert.strictEqual(req2.subagentProvider, 'fork')
   assert.strictEqual(req2.maxTotalAgents, 7)
+
+  // maxTotalAgents 为 null/undefined 时请求省略该键（引擎用默认上限），
+  // 绝不写入 0（引擎对 <1 的 maxTotalAgents 直接 INVALID_ARGUMENT）。
+  const { ctx: nullCtx, defs: nullDefs, requests: nullReqs } = stubContext({ report: 'r' })
+  mod.apply(nullCtx, { maxTotalAgents: null })
+  await nullDefs[0].execute({ topic: 'T' }, exec)
+  assert.strictEqual(nullReqs.length, 1)
+  assert.ok(!('maxTotalAgents' in nullReqs[0]), 'maxTotalAgents: null 不写入请求（引擎默认）')
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑥ 队列语义：子问题超过 maxParallel 时绝不静默丢弃（跨轮续研）
+// ════════════════════════════════════════════════════════════════════════════
+test('⑥ 子问题超过 maxParallel：剩余问题进入下一轮，全部被研究', async () => {
+  const questions = ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6'].map((q) => ({ question: q, dimension: 'd' }))
+  const { result, prompts } = await runScript(SCRIPT, {
+    topic: 'T',
+    questions,
+    depth: 2, // 3 轮上限 × maxParallel 2 = 6，恰好全部研究
+    synthesize: false,
+    review: false,
+    maxParallel: 2,
+  }, {
+    researcher: [
+      { confirmed: [{ claim: 'C1', source: 's1', confidence: 'high' }], uncertain: [], gaps: [] },
+      { confirmed: [{ claim: 'C2', source: 's2', confidence: 'high' }], uncertain: [], gaps: [] },
+      { confirmed: [{ claim: 'C3', source: 's3', confidence: 'high' }], uncertain: [], gaps: [] },
+      { confirmed: [{ claim: 'C4', source: 's4', confidence: 'high' }], uncertain: [], gaps: [] },
+      { confirmed: [{ claim: 'C5', source: 's5', confidence: 'high' }], uncertain: [], gaps: [] },
+      { confirmed: [{ claim: 'C6', source: 's6', confidence: 'high' }], uncertain: [], gaps: [] },
+    ],
+  })
+  assert.strictEqual(result.rounds, 3, '6 个问题按 maxParallel=2 分 3 轮研究')
+  assert.strictEqual(result.subquestions, 6, '所有子问题都被研究（无静默丢弃）')
+  assert.strictEqual(result.completed, 6)
+  for (const q of questions) {
+    assert.ok(result.report.includes('## ' + q.question), `报告应含 ${q.question}`)
+  }
+  assert.strictEqual(prompts.length, 6)
+  assert.deepEqual(prompts.map((p) => p.label), [
+    '研究1·第1轮', '研究2·第1轮',
+    '研究1·第2轮', '研究2·第2轮',
+    '研究1·第3轮', '研究2·第3轮',
+  ], '两两分轮，轮次递增')
 })
