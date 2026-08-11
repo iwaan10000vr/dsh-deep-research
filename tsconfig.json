@@ -1,0 +1,24 @@
+{
+  "extends": "../../deepseek-harness/tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib/types"
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    {
+      "path": "../../deepseek-harness/vendor/cordis"
+    },
+    {
+      "path": "../../deepseek-harness/packages/core/agent"
+    },
+    {
+      "path": "../../deepseek-harness/packages/core/tools"
+    },
+    {
+      "path": "../../deepseek-harness/packages/workflow/workflow"
+    }
+  ]
+}

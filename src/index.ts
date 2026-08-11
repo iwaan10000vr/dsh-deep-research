@@ -49,15 +49,37 @@
  * the parent route. The plugin never fetches the web: search/fetch stays on
  * DSH's built-in `web_search` / `web_fetch`, which children inherit.
  *
+ * Native TypeScript source: the package entry points at this file and the
+ * runtime loads it through Node's native type stripping (>=22.18/24) or the
+ * dsh source launcher's tsx hook — no build step.
+ *
  * @module @dsh-external/dsh-deep-research
  */
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { Context } from 'cordis'
+// Type-only: brings the `ctx.workflows` Context augmentation into this program.
+import type { WorkflowMeta } from '@deepseek-ai/dsh-workflow'
 
 export const name = 'dsh-deep-research'
 
 /** Activate once the tool registry and the official workflow service are available. */
 export const inject = ['tools', 'workflows']
+
+/** Plugin config (all optional). */
+export interface Config {
+  /** Child-provider override passed to every workflow run. */
+  subagentProvider?: string
+  /** Role-level model overrides, one per planner/researcher/synthesizer/reviewer role. */
+  plannerModel?: string
+  researcherModel?: string
+  synthesizerModel?: string
+  reviewerModel?: string
+  /** Per-run total-child ceiling for every workflow run. */
+  maxTotalAgents?: number
+  /** Research concurrency per round. */
+  maxParallel?: number
+}
 
 /** Planner structured output: answer space + dimension coverage + questions. */
 const PLANNER_SCHEMA = {
@@ -354,8 +376,8 @@ return {
 }
 `
 
-/** Plugin config (all optional). */
-export function apply(ctx, config = {}) {
+/** Apply the plugin: register the `deep_research` tool on `ctx.tools`. */
+export function apply(ctx: Context, config: Config = {}) {
   const subagentProvider = config.subagentProvider ?? undefined
   const plannerModel = config.plannerModel ?? undefined
   const researcherModel = config.researcherModel ?? undefined
@@ -363,7 +385,7 @@ export function apply(ctx, config = {}) {
   const reviewerModel = config.reviewerModel ?? synthesizerModel
   const maxTotalAgents = config.maxTotalAgents === undefined
     ? undefined
-    : positiveInt(config.maxTotalAgents, undefined, 'maxTotalAgents')
+    : positiveInt(config.maxTotalAgents, 0, 'maxTotalAgents')
   const maxParallel = config.maxParallel === undefined
     ? 4
     : positiveInt(config.maxParallel, 4, 'maxParallel')
@@ -444,7 +466,7 @@ export function apply(ctx, config = {}) {
       const review = args.review === true
       const questions = parseQuestionList(args.questions)
 
-      const models = {}
+      const models: Record<string, string> = {}
       if (plannerModel !== undefined) models.planner = plannerModel
       if (researcherModel !== undefined) models.researcher = researcherModel
       if (synthesizerModel !== undefined) models.synthesizer = synthesizerModel
@@ -468,7 +490,7 @@ export function apply(ctx, config = {}) {
             { title: '综合', detail: 'Rate-distortion report synthesis' },
             { title: '审查', detail: 'Opt-in error-correcting adversarial review' },
           ],
-        },
+        } satisfies WorkflowMeta,
         args: {
           topic,
           ...(purpose !== undefined ? { purpose } : {}),
@@ -491,14 +513,18 @@ export function apply(ctx, config = {}) {
       if (result.stopReason !== 'completed') {
         throw new Error(`deep_research: workflow run ${result.stopReason}${result.error !== undefined ? ` (${result.error})` : ''}`)
       }
-      const value = result.value
-      if (value === null || typeof value !== 'object' || typeof value.report !== 'string') {
+      const raw: unknown = result.value
+      if (raw === null || typeof raw !== 'object') {
+        throw new Error('deep_research: workflow returned no report')
+      }
+      const record = raw as Record<string, unknown>
+      if (typeof record.report !== 'string') {
         throw new Error('deep_research: workflow returned no report')
       }
       return {
         ok: true,
-        report: value.report,
-        ...(typeof value.review === 'string' ? { review: value.review } : {}),
+        report: record.report,
+        ...(typeof record.review === 'string' ? { review: record.review } : {}),
       }
     },
   }))
@@ -506,7 +532,7 @@ export function apply(ctx, config = {}) {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function parseQuestionList(raw) {
+function parseQuestionList(raw: string | undefined): Array<{ question: string; keywords?: undefined }> {
   if (typeof raw !== 'string') return []
   return raw
     .split('\n')
@@ -515,7 +541,7 @@ function parseQuestionList(raw) {
     .map(question => ({ question, keywords: undefined }))
 }
 
-function positiveInt(value, fallback, label) {
+function positiveInt(value: unknown, fallback: number, label: string): number {
   if (value === undefined || value === null) return fallback
   const n = Number(value)
   if (!Number.isInteger(n) || n < 1) {

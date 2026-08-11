@@ -24,9 +24,21 @@
 dsh-deep-research/
 ├── package.json    # @dsh-external/dsh-deep-research（声明 dsh.bundle.patch）
 ├── cordis.patch.yml  # bundle 补丁：按包名插入插件行
-├── lib/index.js    # cordis 插件：注册 deep_research 工具，提交官方 workflow 脚本
+├── src/index.ts    # cordis 插件：注册 deep_research 工具，提交官方 workflow 脚本（原生 TS，零构建）
+├── tsconfig.json   # typecheck 配置（project references 解析到 sibling deepseek-harness 源码）
 └── README.md
 ```
+
+## 开发与检查
+
+```bash
+pnpm install        # 仅 typescript/@types/node（typecheck 用）
+pnpm run typecheck  # tsc -b，类型从 sibling deepseek-harness checkout 解析
+```
+
+源码即运行时：包入口直接指向 `src/index.ts`，无构建步骤——dsh 源码启动器（tsx hook）
+或 Node ≥22.18 原生类型剥离直接加载。要求 erasable-only TS 语法（无 enum/命名空间等），
+`node --test`/`pnpm typecheck` 会挡住不可移植写法。
 
 ## 安装（新版 profile 插件机制）
 
