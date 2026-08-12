@@ -113,3 +113,11 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-deep-research
 - **失败隔离**：单个子问题研究失败只在该节标注；规划失败则工具报错，主代理可调参重试。
 - 技能模板（`.claude/skills/deep-research`）保留不动，两者独立。
 
+
+## Profile 兼容性
+
+本插件运行时依赖 DSH 官方 workflow 引擎（`ctx.workflows`，peer：`@deepseek-ai/dsh-workflow`）。
+请把它安装进**提供 workflows provider 的 Profile**（如 tui/headless 组合）；若 Profile 未声明
+该 provider（如部分 Web Profile 组合），Loader 会保持 pending——此时请先在 DSH Hub 登记
+workflows provider 关系或改用提供该服务的组合。编译产物（`lib/types/index.js`）为官方
+0810 生产入口，Node 原生可加载。
