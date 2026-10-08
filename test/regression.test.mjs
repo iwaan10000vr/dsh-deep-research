@@ -503,11 +503,18 @@ function checkValue(node, value, path, violations) {
 }
 
 /**
- * stub ctx + Agent 作用域的 workflowEngine；value 为脚本返回值。
- * 插件不再静态 inject 引擎（Web/desktop 组合把引擎 isolate 在 Agent preset 内），
- * 而是从 exec.agent.ctx 宽松读取，所以 stub 必须让 agent.ctx.get('workflowEngine') 可解析。
+ * stub ctx + workflowEngine；value 为脚本返回值。
+ * 插件不静态 inject 引擎（Web/desktop 组合把引擎 isolate 在 preset 的 delegation
+ * 组内，只有同一 isolate 领域内的消费者能看到）。解析顺序是「插件自己的 ctx → 调用方
+ * Agent 的 ctx」，所以 stub 必须让其中至少一个的 get('workflowEngine') 可解析。
+ *
+ * @param value 脚本返回值
+ * @param options.engineOnCtx 是否把引擎挂在插件自己的 ctx 上（默认 true）
+ * @param options.engineOnAgent 是否把引擎挂在 Agent 的 ctx 上（默认 true）
  */
-function stubContext(value) {
+function stubContext(value, options = {}) {
+  const engineOnCtx = options.engineOnCtx ?? true
+  const engineOnAgent = options.engineOnAgent ?? true
   const defs = []
   const requests = []
   const workflowEngine = {
@@ -523,13 +530,14 @@ function stubContext(value) {
   }
   const ctx = {
     tools: { register: (def) => defs.push(def) },
-    workflowEngine,
-    get: (name) => (name === 'workflowEngine' ? workflowEngine : undefined),
+    ...(engineOnCtx ? { workflowEngine } : {}),
+    get: (name) => (name === 'workflowEngine' && engineOnCtx ? workflowEngine : undefined),
   }
-  return { ctx, defs, requests, workflowEngine }
+  const agentCtx = { get: (name) => (name === 'workflowEngine' && engineOnAgent ? workflowEngine : undefined) }
+  return { ctx, agentCtx, defs, requests, workflowEngine }
 }
 
-/** 构造调用了插件工具的 exec：workflowEngine 挂在 agent 的作用域 ctx 上。 */
+/** 构造调用了插件工具的 exec；引擎按 options 决定挂在谁的作用域上。 */
 function stubExec(ctx, signal = new EventTarget()) {
   return { agent: { id: 'parent', ctx }, signal }
 }
@@ -567,14 +575,20 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
   await assert.rejects(def.execute({ topic: 'T', depth: 4 }, exec), /depth must be 1, 2 or 3/)
   assert.strictEqual(requests.length, 0, '校验失败时不进入 workflowEngine.start')
 
-  // 引擎缺失时（Agent preset 未提供 workflowEngine）应给出明确错误，而不是崩溃。
-  const bareExec = { agent: { id: 'parent', ctx: { get: () => undefined } }, signal: new EventTarget() }
+  // 引擎缺失时（插件自己的 ctx 与 Agent 的 ctx 两侧都看不到 workflowEngine）
+  // 应给出明确错误，而不是崩溃。
+  const {
+    ctx: noEngineCtx,
+    defs: noEngineDefs,
+    requests: noEngineReqs,
+  } = stubContext({ report: 'r' }, { engineOnCtx: false, engineOnAgent: false })
+  mod.apply(noEngineCtx, {})
   await assert.rejects(
-    def.execute({ topic: 'T' }, bareExec),
+    noEngineDefs[0].execute({ topic: 'T' }, stubExec(noEngineCtx)),
     /requires an Agent preset with workflowEngine/,
-    '无引擎的 preset 应报明确错误',
+    '两侧都无引擎的 preset 应报明确错误',
   )
-  assert.strictEqual(requests.length, 0, '无引擎时不应进入 workflowEngine.start')
+  assert.strictEqual(noEngineReqs.length, 0, '无引擎时不应进入 workflowEngine.start')
 
   const ok = await def.execute({ topic: 'T', depth: 1, questions: '1. Q1\n2. Q2' }, exec)
   assert.strictEqual(ok.ok, true)
@@ -694,4 +708,42 @@ test('⑦ 并发上限：同时运行的 researcher 不超过 maxParallel（1=�
 
   assert.strictEqual(await probe(1), 1, 'maxParallel=1 时严格串行（无重叠）')
   assert.strictEqual(await probe(2), 2, 'maxParallel=2 时同时最多 2 个')
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑧ 引擎解析顺序：插件自身的 ctx 优先于调用方 Agent 的 ctx
+//    （Web/desktop 把 workflowEngine isolate 在 preset 的 delegation 组内，
+//      插件必须挂在那组里才能看见；宿主级挂载则回退到 Agent 作用域）
+// ════════════════════════════════════════════════════════════════════════════
+test('⑧ 引擎解析：插件自身 ctx 优先，Agent 作用域作为回退', async () => {
+  const { mod } = await loadPlugin()
+
+  // (a) 只有插件自身 ctx 能看到引擎（= 挂在 delegation 组内）：必须可用。
+  {
+    const { ctx, defs, requests } = stubContext({ report: 'r' }, { engineOnCtx: true, engineOnAgent: false })
+    mod.apply(ctx, {})
+    const ok = await defs[0].execute({ topic: 'T', depth: 1, questions: '1. Q1' }, stubExec({ get: () => undefined }))
+    assert.strictEqual(ok.ok, true, '插件自身 ctx 有引擎时应正常启动 workflow')
+    assert.strictEqual(requests.length, 1)
+  }
+
+  // (b) 只有 Agent 的 ctx 能看到引擎（= 宿主级挂载的旧路径）：仍然可用。
+  {
+    const { ctx, agentCtx, defs, requests } = stubContext({ report: 'r' }, { engineOnCtx: false, engineOnAgent: true })
+    mod.apply(ctx, {})
+    const ok = await defs[0].execute({ topic: 'T', depth: 1, questions: '1. Q1' }, stubExec(agentCtx))
+    assert.strictEqual(ok.ok, true, 'Agent 作用域有引擎时应正常启动 workflow')
+    assert.strictEqual(requests.length, 1)
+  }
+
+  // (c) 两侧都没有：明确报错，且提示正确的挂载位置。
+  {
+    const { ctx, defs } = stubContext({ report: 'r' }, { engineOnCtx: false, engineOnAgent: false })
+    mod.apply(ctx, {})
+    await assert.rejects(
+      defs[0].execute({ topic: 'T' }, stubExec(ctx)),
+      /mount this plugin inside the preset's `delegation` group/,
+      '错误信息应指向 delegation 组这个正确挂载点',
+    )
+  }
 })
