@@ -3,7 +3,7 @@
  *
  * A REAL plugin (not a skill): registers one model-facing tool, `deep_research`,
  * that runs the user's deep-research workflow ON TOP OF DSH'S OFFICIAL WORKFLOW
- * ENGINE (`ctx.workflows`, `@deepseek-ai/dsh-workflow-workerthread`) — no custom
+ * ENGINE (`ctx.workflowEngine`, `@deepseek-ai/dsh-workflow-workerthread`) — no custom
  * subagent plumbing, no TUI surface, no prompt injection.
  *
  * The pipeline is a LIVE ADAPTIVE LOOP designed from cybernetics + information

@@ -1,7 +1,7 @@
 # @dsh-external/dsh-deep-research
 
 把 deep-research 流程做成 **DSH 扩展插件**（plugin，与 skill 体系分开），
-基于 **DSH 官方 workflow 引擎**（`ctx.workflows` / `@deepseek-ai/dsh-workflow-workerthread`）
+基于 **DSH 官方 workflow 引擎**（`ctx.workflowEngine` / `@deepseek-ai/dsh-workflow-workerthread`）
 实现，按 **控制论 + 信息论** 设计——不是固定提示词流水线，而是**活的、自适应的研究闭环**。
 
 ## 理论 → 机制
@@ -116,8 +116,8 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-deep-research
 
 ## Profile 兼容性
 
-本插件运行时依赖 DSH 官方 workflow 引擎（`ctx.workflows`，peer：`@deepseek-ai/dsh-workflow`）。
-请把它安装进**提供 workflows provider 的 Profile**（如 tui/headless 组合）；若 Profile 未声明
+本插件运行时依赖 DSH 官方 workflow 引擎（`ctx.workflowEngine`，peer：`@deepseek-ai/dsh-workflow`）。
+请把它安装进**提供 workflowEngine provider 的 Profile**（如 tui/headless 组合）；若 Profile 未声明
 该 provider（如部分 Web Profile 组合），Loader 会保持 pending——此时请先在 DSH Hub 登记
-workflows provider 关系或改用提供该服务的组合。编译产物（`lib/types/index.js`）为官方
+workflowEngine provider 关系或改用提供该服务的组合。编译产物（`lib/types/index.js`）为官方
 0810 生产入口，Node 原生可加载。

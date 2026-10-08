@@ -30,8 +30,8 @@
   },
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": "^0.0.1",
-    "@deepseek-ai/dsh-workflow": "^0.0.1",
+    "@deepseek-ai/dsh-tools": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-workflow": "^0.2.0-rc.2",
     "cordis": "^4.0.0-rc.7"
   },
   "devDependencies": {
