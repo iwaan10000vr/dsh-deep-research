@@ -598,7 +598,7 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
   assert.strictEqual(req.args.depth, 1)
   assert.strictEqual(req.args.synthesize, true, 'synthesize 默认 true')
   assert.strictEqual(req.args.review, false, 'review 默认 false')
-  assert.strictEqual(req.args.maxParallel, 4, 'maxParallel 默认 4')
+  assert.strictEqual(req.args.maxParallel, 1, 'maxParallel 默认 1（本地引擎串行）')
   assert.ok(!('models' in req.args), '未配置 models 时不传 models 键')
   assert.ok(!('subagentProvider' in req), '未配置时不传 subagentProvider')
 
@@ -628,14 +628,14 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-// ⑥ 队列语义：子问题超过 maxParallel 时绝不静默丢弃（跨轮续研）
+// ⑥ 队列语义：单轮消化全部子问题，绝不静默丢弃
 // ════════════════════════════════════════════════════════════════════════════
-test('⑥ 子问题超过 maxParallel：剩余问题进入下一轮，全部被研究', async () => {
+test('⑥ 全队列在单轮内消化：maxParallel 只限并发，不再把问题拆到后续轮次', async () => {
   const questions = ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6'].map((q) => ({ question: q, dimension: 'd' }))
   const { result, prompts } = await runScript(SCRIPT, {
     topic: 'T',
     questions,
-    depth: 2, // 3 轮上限 × maxParallel 2 = 6，恰好全部研究
+    depth: 2,
     synthesize: false,
     review: false,
     maxParallel: 2,
@@ -649,7 +649,7 @@ test('⑥ 子问题超过 maxParallel：剩余问题进入下一轮，全部被�
       { confirmed: [{ claim: 'C6', source: 's6', confidence: 'high' }], uncertain: [], gaps: [] },
     ],
   })
-  assert.strictEqual(result.rounds, 3, '6 个问题按 maxParallel=2 分 3 轮研究')
+  assert.strictEqual(result.rounds, 1, '一轮消化全部 6 个子问题（轮次上限留给补充研究，不用于余留队列）')
   assert.strictEqual(result.subquestions, 6, '所有子问题都被研究（无静默丢弃）')
   assert.strictEqual(result.completed, 6)
   for (const q of questions) {
@@ -657,8 +657,41 @@ test('⑥ 子问题超过 maxParallel：剩余问题进入下一轮，全部被�
   }
   assert.strictEqual(prompts.length, 6)
   assert.deepEqual(prompts.map((p) => p.label), [
-    '研究1·第1轮', '研究2·第1轮',
-    '研究1·第2轮', '研究2·第2轮',
-    '研究1·第3轮', '研究2·第3轮',
-  ], '两两分轮，轮次递增')
+    '研究1·第1轮', '研究2·第1轮', '研究3·第1轮',
+    '研究4·第1轮', '研究5·第1轮', '研究6·第1轮',
+  ], '同一轮内按序编号，轮次不递增')
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑦ 并发上限：同时运行的 researcher 绝不超过 maxParallel（本地引擎串行的核心保证）
+// ════════════════════════════════════════════════════════════════════════════
+test('⑦ 并发上限：同时运行的 researcher 不超过 maxParallel（1=严格串行）', async () => {
+  const questions = ['Q1', 'Q2', 'Q3', 'Q4', 'Q5', 'Q6'].map((q) => ({ question: q, dimension: 'd' }))
+
+  const probe = async (maxParallel) => {
+    let inFlight = 0
+    let peak = 0
+    const one = () => async () => {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      inFlight -= 1
+      return mk([{ claim: 'C', source: 's', confidence: 'high' }])
+    }
+    const { result } = await runScript(SCRIPT, {
+      topic: 'T',
+      questions,
+      depth: 1,
+      synthesize: false,
+      review: false,
+      maxParallel,
+    }, {
+      researcher: questions.map(one),
+    })
+    assert.strictEqual(result.completed, questions.length, '全部子问题仍被研究')
+    return peak
+  }
+
+  assert.strictEqual(await probe(1), 1, 'maxParallel=1 时严格串行（无重叠）')
+  assert.strictEqual(await probe(2), 2, 'maxParallel=2 时同时最多 2 个')
 })

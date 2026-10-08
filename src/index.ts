@@ -80,7 +80,12 @@ export interface Config {
   reviewerModel?: string
   /** Per-run total-child ceiling for every workflow run. */
   maxTotalAgents?: number
-  /** Research concurrency per round. */
+  /**
+   * How many researchers may run at the SAME TIME (default 1 = strictly serial).
+   * A local engine (Strata, llama.cpp, ...) serves one request at a time, so
+   * raising this only queues siblings — it does not speed them up, and the ones
+   * at the back can hit the client's idle-stream timeout while they wait.
+   */
   maxParallel?: number
 }
 
@@ -175,6 +180,15 @@ const RESEARCHER_SCHEMA = ${JSON.stringify(RESEARCHER_SCHEMA)}
 const { topic, questions, depth, synthesize, review, models, purpose, maxParallel } = args
 const M = models ?? {}
 const LIMIT = depth >= 3 ? 4 : depth === 1 ? 2 : 3
+// concurrency = how many researchers run AT THE SAME TIME (1 = strictly serial).
+// It is deliberately separate from how many questions a round DRAINS: a local
+// engine serves one request at a time, so queueing four siblings does not make
+// them faster, it only makes the ones at the back wait (and idle-timeout).
+const concurrency = Math.max(1, Number(maxParallel) || 1)
+// maxFollowUps bounds how many high-priority gaps one round may turn into
+// follow-up questions. It is a research-breadth knob, not a concurrency one:
+// serializing the engine must not starve the adaptive re-planning loop.
+const maxFollowUps = Math.max(concurrency, 4)
 
 function confidenceLabel(c) {
   return c === 'high' ? '高' : c === 'medium' ? '中' : c === 'low' ? '低' : '中'
@@ -280,19 +294,31 @@ let round = 0
 while (pending.length > 0 && round < depth + 1) {
   round += 1
   phase('研究·第' + round + '轮')
-  const batch = pending.slice(0, maxParallel)
-  const found = await parallel(batch.map((q, i) => () => agent(researcherPrompt(q, round, round > 1), {
-    label: '研究' + (i + 1) + '·第' + round + '轮',
-    phase: '研究·第' + round + '轮',
-    schema: RESEARCHER_SCHEMA,
-    ...(M.researcher ? { model: M.researcher } : {}),
-  })))
+  // Drain the WHOLE queue this round, but never run more than concurrency
+  // researchers at once. A round therefore covers every pending question in
+  // order; nothing is deferred to a later round (the round cap is spent on
+  // follow-ups, not on leftovers), and no sibling sits idle waiting for the
+  // engine while the client's stream timeout runs down.
+  const batch = pending.slice()
+  const found = []
+  for (let start = 0; start < batch.length; start += concurrency) {
+    const chunk = batch.slice(start, start + concurrency)
+    const got = await parallel(chunk.map((q, i) => () => agent(researcherPrompt(q, round, round > 1), {
+      label: '研究' + (start + i + 1) + '·第' + round + '轮',
+      phase: '研究·第' + round + '轮',
+      schema: RESEARCHER_SCHEMA,
+      ...(M.researcher ? { model: M.researcher } : {}),
+    })))
+    for (let i = 0; i < chunk.length; i += 1) found[start + i] = got[i]
+  }
   batch.forEach((q, i) => {
     if (found[i]) results[q.question] = found[i]
   })
   rounds.push(batch.map((q, i) => ({ q, f: found[i] })))
 
   // 收敛评估：收集本轮所有 high-priority 缺口 → 下一轮动态补充。
+  // Follow-up leads are bounded by maxFollowUps (a research-breadth knob),
+  // NOT by concurrency (how many run side by side).
   const leads = []
   const seen = new Set()
   for (const item of batch) {
@@ -300,15 +326,14 @@ while (pending.length > 0 && round < depth + 1) {
     if (!f || !Array.isArray(f.gaps)) continue
     for (const g of f.gaps) {
       if (g.priority !== 'high') continue
-      if (seen.has(g.aspect) || leads.length >= maxParallel) continue
+      if (seen.has(g.aspect) || leads.length >= maxFollowUps) continue
       seen.add(g.aspect)
       leads.push({ question: g.aspect, followUp: true })
     }
   }
-  pending = [...pending.slice(maxParallel), ...leads]
-  // 队列语义：本轮未处理的子问题（超出 maxParallel 的部分）留在队首，
-  // 下一轮继续研究；high-priority 缺口作为补充问题排在它们之后。
-  // 边际信息增益收敛：本轮没有产出任何新的 high-priority 缺口 → 循环自然结束。
+  pending = leads
+  // 队列语义：本轮已研究队列中的全部子问题，因此下一轮只剩 high-priority 缺口
+  // 作为补充问题；若没有新的 high-priority 缺口，循环自然结束（边际增益为零）。
 }
 
 const ordered = []
@@ -394,9 +419,12 @@ export function apply(ctx: Context, config: Config = {}) {
   const maxTotalAgents = config.maxTotalAgents === undefined || config.maxTotalAgents === null
     ? undefined
     : positiveInt(config.maxTotalAgents, 0, 'maxTotalAgents')
+  // Default 1: run researchers one at a time. The round still drains the whole
+  // question queue, so serial execution costs nothing but removes the sibling
+  // queueing that idle-times out behind a single local engine.
   const maxParallel = config.maxParallel === undefined
-    ? 4
-    : positiveInt(config.maxParallel, 4, 'maxParallel')
+    ? 1
+    : positiveInt(config.maxParallel, 1, 'maxParallel')
 
   ctx.tools.register(defineTool({
     name: 'deep_research',

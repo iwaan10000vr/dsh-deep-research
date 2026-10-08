@@ -60,7 +60,7 @@
  */
 import type { Context } from 'cordis';
 export declare const name = "dsh-deep-research";
-/** Activate once the tool registry and the official workflow service are available. */
+/** Activate once the tool registry is available; each calling Agent supplies its scoped workflow engine. */
 export declare const inject: string[];
 /** Plugin config (all optional). */
 export interface Config {
@@ -73,7 +73,12 @@ export interface Config {
     reviewerModel?: string;
     /** Per-run total-child ceiling for every workflow run. */
     maxTotalAgents?: number;
-    /** Research concurrency per round. */
+    /**
+     * How many researchers may run at the SAME TIME (default 1 = strictly serial).
+     * A local engine (Strata, llama.cpp, ...) serves one request at a time, so
+     * raising this only queues siblings — it does not speed them up, and the ones
+     * at the back can hit the client's idle-stream timeout while they wait.
+     */
     maxParallel?: number;
 }
 /** Apply the plugin: register the `deep_research` tool on `ctx.tools`. */
