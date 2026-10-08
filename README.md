@@ -63,6 +63,28 @@ for (let start = 0; start < batch.length; start += concurrency) {
 - **合計処理時間はほぼ変わらない** → 並列化で得ていたものが元々無かったため
 - `maxParallel` を上げれば従来どおり並列にもできる（リモート API を使う場合は `4` などに設定）
 
+## このフォークの変更点 2（`workflowEngine` に届くようにする）
+
+**上流の配置では、このプラグインは動きませんでした。**
+
+workflow エンジンは preset の `delegation` グループに `isolate: workflowEngine: true` で隔離されており、
+**同じ分離領域にいる利用者しか見えません**。プラグイン同梱のパッチはホスト直下に行を挿入するため、
+`ctx.get('workflowEngine')` が空になり、呼び出しは必ず失敗していました。
+
+```text
+deep_research requires an Agent preset with workflowEngine
+```
+
+実際にこの状態では、モデルが `deep_research` を諦めて**組み込みの `workflow` ツールで13並列を手組み**していました
+（エンジンは 1 件ずつしか処理しないため、後半が待ち行列でタイムアウトし全件失敗）。
+
+**修正は 2 点です。**
+
+1. **プラグイン側**：エンジンを**自分の ctx 優先**で解決する（上のコード）。`delegation` グループ内に置けば同じ分離領域になり、正しく見えます
+2. **profile 側**：ホスト直下の行を無効化し、`preset-standard` を上書きして `delegation` グループの内側に配置する
+
+詳細と設定例は [Profile 互換性](#profile-互換性重要正しい配置) を参照してください。
+
 ## 理論 → メカニズム
 
 | 理論 | プラグインでの実装 |
@@ -172,22 +194,83 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-deep-research
 - **失敗の隔離**：個々の子問題の研究失敗はその節に注記されるだけです。計画が失敗した場合はツールがエラーを返し、呼び出し側がパラメータを変えて再試行できます。
 - スキルテンプレート（`.claude/skills/deep-research`）はそのまま残してあり、両者は独立しています。
 
-## Profile 互換性
+## Profile 互換性（重要：正しい配置）
 
 このプラグインは実行時に DSH 公式の workflow エンジン（`workflowEngine`、peer：`@deepseek-ai/dsh-workflow`）に依存します。
 
-**プラグインは `inject = ['tools']` しか静的に宣言しません。** Web / desktop の構成は workflow エンジンを
-**意図的に Agent preset の中に隔離**しており（`delegation` グループの `isolate: workflowEngine: true`）、
-ホストのルートにはそのサービスが存在しません（ルート側の `workflow-ptc` / `tool-workflow` は `disabled: true`）。
-したがってホスト階層で `workflowEngine` を `inject` に書くと、そのエントリは永久に pending のままになります。
-正しい方法は、呼び出し時に**呼び出し元 Agent のスコープ付きコンテキスト**から解決することです：
-`exec.agent.ctx.get('workflowEngine')`（`get()` は緩い検索。未宣言でプロパティアクセサに直接触ると
-`cannot get property ... without inject` を投げます）。見つからない場合は明確なエラーを返します。
+**workflow エンジンは Agent preset の中に `isolate` で隔離されています。** `standard` / `ptc` / `cordis` preset は次のように宣言しています。
 
-実際の影響：`standard` / `ptc` など delegation グループを含む preset は使用できます。その能力を持たない preset では
-「requires an Agent preset with workflowEngine」という明確なエラーになり、静かな pending やプロセス終了にはなりません。
-**`workflowEngine` を `inject` に戻さないでください。** コンパイル済みの成果物（`lib/types/index.js`）が
-本番のエントリで、Node からそのまま読み込めます。
+```yaml
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true      # ← この分離領域の中だけが見える
+  config:
+    - id: workflow-ptc        # エンジンの提供側
+    - id: tool-workflow       # 同じ領域内の利用者なので見える
+```
+
+`isolate` は「提供側と、**同じ分離領域にいる利用者**をまとめて隔離する」仕組みです。したがって：
+
+- **ホスト直下に置くと動きません。** ホストのルートにはこのサービスが存在せず（ルート側の `workflow-ptc` / `tool-workflow` は `disabled: true`）、
+  `ctx.get('workflowEngine')` は空になります。
+- **プラグインは `delegation` グループの内側に置いてください。** そうして初めて同じ分離領域に入り、エンジンが見えます。
+
+### profile 側の設定
+
+プラグイン同梱の `cordis.patch.yml` はホスト直下に行を挿入するだけなので、**それだけでは動きません**。profile の
+`cordis.patch.yml` で次の 2 点を行う必要があります（この手順は当リポジトリの利用環境で実際に検証済みです）。
+
+```yaml
+# 1) ホスト直下の行は無効化する（エンジンが見えず、必ず失敗するため）
+- id: dsh-deep-research
+  disabled: true
+
+# 2) preset を丸ごと上書きし、delegation グループの内側に置く
+#    ※ パッチの `config` は深いマージをせず「置換」なので、preset の全行を書き直す必要があります
+- id: preset-standard
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: standard
+    order: 1
+    plugins:
+      # ...（省略：バンドル内の preset-standard の内容をそのまま）...
+      - id: delegation
+        name: cordis:group
+        group: true
+        isolate:
+          workflowEngine: true
+        config:
+          - id: workflow-ptc
+            name: '@deepseek-ai/dsh-workflow-ptc'
+            config:
+              provider: spawn
+          - id: tool-workflow
+            name: '@deepseek-ai/dsh-tool-workflow'
+          - id: deep-research                      # ← これを追加
+            name: '@dsh-external/dsh-deep-research'
+          # ...（残りの行）...
+```
+
+> [!WARNING]
+> `config` は**置換**であってマージではありません。preset を上書きする場合、その preset の行を**すべて**書き直す必要があります。
+> DSH を更新して preset に行が追加された場合は、このブロックを再生成してください（古いままだと新しい行が失われます）。
+
+### コード側の解決順序
+
+プラグインは**自分の ctx を優先**してエンジンを解決します。これにより、`delegation` グループ内に置かれたときに正しく動きます。
+
+```js
+const workflowEngine = ctx.get('workflowEngine') ?? parent.ctx.get('workflowEngine')
+```
+
+1. **自分の ctx** — `delegation` グループ内に置かれた場合（推奨・実績あり）。同じ分離領域なので見える
+2. **呼び出し元 Agent の ctx** — ホスト直下に置いた場合のフォールバック
+
+どちらでも見つからない場合は、**正しい配置を名指しするエラー**を返します（静かな pending やプロセス終了にはなりません）。
+`get()` は緩い検索です（未宣言でプロパティアクセサに直接触ると `cannot get property ... without inject` を投げます）。
+**`workflowEngine` を静的な `inject` に戻さないでください。**
 
 ## 上流との関係
 
