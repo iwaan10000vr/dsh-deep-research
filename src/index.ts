@@ -540,13 +540,13 @@ export function apply(ctx: Context, config: Config = {}) {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-function parseQuestionList(raw: string | undefined): Array<{ question: string; keywords?: undefined }> {
+function parseQuestionList(raw: string | undefined): Array<{ question: string }> {
   if (typeof raw !== 'string') return []
   return raw
     .split('\n')
     .map(line => line.replace(/^\s*(?:\d+[.、)])?\s*/, '').trim())
     .filter(line => line.length > 0)
-    .map(question => ({ question, keywords: undefined }))
+    .map(question => ({ question }))
 }
 
 function positiveInt(value: unknown, fallback: number, label: string): number {

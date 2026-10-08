@@ -171,6 +171,38 @@ async function runScript(body, args, roles = {}) {
 /** vm 求值产生的数组/对象属于 vm realm，deepStrictEqual 会因原型不同误报——JSON 往返转宿主值。 */
 const plain = (value) => JSON.parse(JSON.stringify(value))
 
+/**
+ * 无损 JSON 判据（镜像引擎 @deepseek-ai/dsh-util-values 的 snapshotJsonValue）：
+ * 只要存在显式 undefined / NaN / 函数 / symbol / exotic prototype 等
+ * 有损值，就返回 false。JSON 往返（plain()）会静默丢弃这些键，因此
+ * 单靠 plain() 断言会漏掉「显式 undefined 属性」这一整类缺陷（issue #9）。
+ */
+function isLosslessJson(value, seen = new WeakSet()) {
+  if (value === null) return true
+  const t = typeof value
+  if (t === 'string' || t === 'boolean') return true
+  if (t === 'number') return Number.isFinite(value) && !Object.is(value, -0)
+  if (t !== 'object') return false // undefined / function / symbol / bigint
+  if (seen.has(value)) return false // circular
+  seen.add(value)
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      if (!(i in value)) return false // sparse
+      if (!isLosslessJson(value[i], seen)) return false
+    }
+    seen.delete(value)
+    return true
+  }
+  const proto = Object.getPrototypeOf(value)
+  if (proto !== null && Object.getPrototypeOf(proto) !== null) return false // exotic prototype
+  if (Object.getOwnPropertySymbols(value).length > 0) return false
+  for (const key of Object.keys(value)) {
+    if (!isLosslessJson(value[key], seen)) return false
+  }
+  seen.delete(value)
+  return true
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // ① 跳过规划（questions 已给）：单轮研究，收敛后返回证据状态报告
 // ════════════════════════════════════════════════════════════════════════════
@@ -536,6 +568,13 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
     { question: 'Q1' },
     { question: 'Q2' },
   ], 'questions 解析为数组透传')
+  // issue #9：显式 undefined 属性是有损 JSON，会让真实引擎的 begin 绑定抛
+  // "workflow binding value must be lossless JSON"。plain() 会把它洗掉，故此处
+  // 用严格判据直接检查透传的 args。
+  assert.ok(isLosslessJson(req.args), 'args 必须是无损 JSON（不得含显式 undefined 属性）')
+  for (const q of req.args.questions) {
+    assert.deepEqual(Object.keys(q), ['question'], 'questions 项不得携带显式 undefined 的 keywords 键')
+  }
   assert.strictEqual(req.args.depth, 1)
   assert.strictEqual(req.args.synthesize, true, 'synthesize 默认 true')
   assert.strictEqual(req.args.review, false, 'review 默认 false')
