@@ -1,7 +1,7 @@
 # @dsh-external/dsh-deep-research
 
 把 deep-research 流程做成 **DSH 扩展插件**（plugin，与 skill 体系分开），
-基于 **DSH 官方 workflow 引擎**（`ctx.workflowEngine` / `@deepseek-ai/dsh-workflow-workerthread`）
+基于 **DSH 官方 workflow 引擎**（`exec.agent.ctx.workflowEngine` / `@deepseek-ai/dsh-workflow-workerthread`）
 实现，按 **控制论 + 信息论** 设计——不是固定提示词流水线，而是**活的、自适应的研究闭环**。
 
 ## 理论 → 机制
@@ -116,8 +116,16 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-deep-research
 
 ## Profile 兼容性
 
-本插件运行时依赖 DSH 官方 workflow 引擎（`ctx.workflowEngine`，peer：`@deepseek-ai/dsh-workflow`）。
-请把它安装进**提供 workflowEngine provider 的 Profile**（如 tui/headless 组合）；若 Profile 未声明
-该 provider（如部分 Web Profile 组合），Loader 会保持 pending——此时请先在 DSH Hub 登记
-workflowEngine provider 关系或改用提供该服务的组合。编译产物（`lib/types/index.js`）为官方
-0810 生产入口，Node 原生可加载。
+本插件运行时依赖 DSH 官方 workflow 引擎（`workflowEngine`，peer：`@deepseek-ai/dsh-workflow`）。
+
+**插件只静态声明 `inject = ['tools']`**：Web / desktop 组合刻意把 workflow 引擎
+**隔离在 Agent preset 内**（`delegation` 组 `isolate: workflowEngine: true`），宿主根上并没有
+该服务（根级 `workflow-ptc` / `tool-workflow` 是 `disabled: true`）。因此宿主级若把
+`workflowEngine` 写进 `inject`，条目会永远 pending。正确做法是调用时从**调用方 Agent 的作用域
+上下文**解析：`exec.agent.ctx.get('workflowEngine')`（`get()` 是宽松查找；未声明时直接访问
+属性访问器会抛 `cannot get property ... without inject`），找不到时返回明确错误。
+
+实际影响：`standard` / `ptc` 等含 delegation 组的 preset 可用；不含该能力的 preset 会得到
+「requires an Agent preset with workflowEngine」的明确报错，而不是静默 pending 或进程退出。
+**不要把 workflowEngine 加回 `inject`。** 编译产物（`lib/types/index.js`）为生产入口，
+Node 原生可加载。

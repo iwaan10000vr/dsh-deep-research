@@ -502,25 +502,36 @@ function checkValue(node, value, path, violations) {
   }
 }
 
-/** stub ctx + stub workflowEngine.start；value 为脚本返回值。 */
+/**
+ * stub ctx + Agent 作用域的 workflowEngine；value 为脚本返回值。
+ * 插件不再静态 inject 引擎（Web/desktop 组合把引擎 isolate 在 Agent preset 内），
+ * 而是从 exec.agent.ctx 宽松读取，所以 stub 必须让 agent.ctx.get('workflowEngine') 可解析。
+ */
 function stubContext(value) {
   const defs = []
   const requests = []
-  const ctx = {
-    tools: { register: (def) => defs.push(def) },
-    workflowEngine: {
-      start: (request) => {
-        requests.push(request)
-        return {
-          result: Promise.resolve({ stopReason: 'completed', value }),
-          cancel: () => {},
-          dispose: async () => {},
-          id: 'run-1',
-        }
-      },
+  const workflowEngine = {
+    start: (request) => {
+      requests.push(request)
+      return {
+        result: Promise.resolve({ stopReason: 'completed', value }),
+        cancel: () => {},
+        dispose: async () => {},
+        id: 'run-1',
+      }
     },
   }
-  return { ctx, defs, requests }
+  const ctx = {
+    tools: { register: (def) => defs.push(def) },
+    workflowEngine,
+    get: (name) => (name === 'workflowEngine' ? workflowEngine : undefined),
+  }
+  return { ctx, defs, requests, workflowEngine }
+}
+
+/** 构造调用了插件工具的 exec：workflowEngine 挂在 agent 的作用域 ctx 上。 */
+function stubExec(ctx, signal = new EventTarget()) {
+  return { agent: { id: 'parent', ctx }, signal }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -534,7 +545,7 @@ test('④ 工具注册与输出 schema 编译通过', async () => {
   const def = defs[0]
   assert.strictEqual(def.name, 'deep_research')
   assert.strictEqual(mod.name, 'dsh-deep-research')
-  assert.deepEqual(plain(mod.inject), ['tools', 'workflowEngine'], 'inject 声明 tools + workflowEngine')
+  assert.deepEqual(plain(mod.inject), ['tools'], 'inject 只声明 tools（引擎经 Agent 作用域解析）')
   assert.doesNotThrow(() => assertSupportedJsonSchema(def.output.schema), 'output.schema 应在引擎受支持子集内')
   assert.doesNotThrow(() => assertSupportedJsonSchema(def.parameters), 'parameters 应编译为受支持的对象 schema')
   const valid = { ok: true, report: '# r', review: '审阅' }
@@ -550,11 +561,20 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
   const { ctx, defs, requests } = stubContext({ report: 'r' })
   mod.apply(ctx, {})
   const def = defs[0]
-  const exec = { agent: { id: 'parent' }, signal: new EventTarget() }
+  const exec = stubExec(ctx)
 
   await assert.rejects(def.execute({ topic: '   ' }, exec), /topic must not be empty/)
   await assert.rejects(def.execute({ topic: 'T', depth: 4 }, exec), /depth must be 1, 2 or 3/)
   assert.strictEqual(requests.length, 0, '校验失败时不进入 workflowEngine.start')
+
+  // 引擎缺失时（Agent preset 未提供 workflowEngine）应给出明确错误，而不是崩溃。
+  const bareExec = { agent: { id: 'parent', ctx: { get: () => undefined } }, signal: new EventTarget() }
+  await assert.rejects(
+    def.execute({ topic: 'T' }, bareExec),
+    /requires an Agent preset with workflowEngine/,
+    '无引擎的 preset 应报明确错误',
+  )
+  assert.strictEqual(requests.length, 0, '无引擎时不应进入 workflowEngine.start')
 
   const ok = await def.execute({ topic: 'T', depth: 1, questions: '1. Q1\n2. Q2' }, exec)
   assert.strictEqual(ok.ok, true)
@@ -591,7 +611,7 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
     subagentProvider: 'fork',
     maxTotalAgents: 7,
   })
-  await defs2[0].execute({ topic: 'T', depth: 2 }, exec)
+  await defs2[0].execute({ topic: 'T', depth: 2 }, stubExec(ctx2))
   const req2 = requests2[0]
   assert.deepEqual(plain(req2.args.models), { planner: 'pm', researcher: 'rm' }, '角色模型透传')
   assert.strictEqual(req2.args.maxParallel, 2)
@@ -602,7 +622,7 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
   // 绝不写入 0（引擎对 <1 的 maxTotalAgents 直接 INVALID_ARGUMENT）。
   const { ctx: nullCtx, defs: nullDefs, requests: nullReqs } = stubContext({ report: 'r' })
   mod.apply(nullCtx, { maxTotalAgents: null })
-  await nullDefs[0].execute({ topic: 'T' }, exec)
+  await nullDefs[0].execute({ topic: 'T' }, stubExec(nullCtx))
   assert.strictEqual(nullReqs.length, 1)
   assert.ok(!('maxTotalAgents' in nullReqs[0]), 'maxTotalAgents: null 不写入请求（引擎默认）')
 })

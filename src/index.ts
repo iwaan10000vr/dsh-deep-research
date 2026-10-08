@@ -3,7 +3,7 @@
  *
  * A REAL plugin (not a skill): registers one model-facing tool, `deep_research`,
  * that runs the user's deep-research workflow ON TOP OF DSH'S OFFICIAL WORKFLOW
- * ENGINE (`ctx.workflowEngine`, `@deepseek-ai/dsh-workflow-workerthread`) — no custom
+ * ENGINE (`exec.agent.ctx.workflowEngine`, `@deepseek-ai/dsh-workflow-workerthread`) — no custom
  * subagent plumbing, no TUI surface, no prompt injection.
  *
  * The pipeline is a LIVE ADAPTIVE LOOP designed from cybernetics + information
@@ -61,13 +61,13 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Context } from 'cordis'
-// Type-only: brings the `ctx.workflowEngine` Context augmentation into this program.
+// Type-only: brings the `workflowEngine` Context augmentation into this program.
 import type { WorkflowMeta } from '@deepseek-ai/dsh-workflow'
 
 export const name = 'dsh-deep-research'
 
-/** Activate once the tool registry and the official workflow service are available. */
-export const inject = ['tools', 'workflowEngine']
+/** Activate once the tool registry is available; each calling Agent supplies its scoped workflow engine. */
+export const inject = ['tools']
 
 /** Plugin config (all optional). */
 export interface Config {
@@ -460,6 +460,15 @@ export function apply(ctx: Context, config: Config = {}) {
       if (!parent) {
         throw new Error('deep_research requires a calling agent (exec.agent was undefined)')
       }
+      // The Web/desktop composition mounts the workflow engine inside each Agent
+      // preset (`isolate: workflowEngine`), not on the host root, so a static
+      // top-level inject can never see it. Resolve it from the calling Agent's
+      // scoped context instead; `get()` is the non-throwing lookup (a bare
+      // `ctx.workflowEngine` accessor throws when the service is not injected).
+      const workflowEngine = parent.ctx.get('workflowEngine')
+      if (!workflowEngine) {
+        throw new Error('deep_research requires an Agent preset with workflowEngine')
+      }
 
       const topic = String(args.topic).trim()
       if (topic.length === 0) throw new Error('deep_research: topic must not be empty')
@@ -480,7 +489,7 @@ export function apply(ctx: Context, config: Config = {}) {
       if (synthesizerModel !== undefined) models.synthesizer = synthesizerModel
       if (reviewerModel !== undefined) models.reviewer = reviewerModel
 
-      const run = ctx.workflowEngine.start({
+      const run = workflowEngine.start({
         script: SCRIPT,
         meta: {
           name: 'deep-research',
