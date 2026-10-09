@@ -703,9 +703,22 @@ function stubJobs() {
   return { jobs, started }
 }
 
-/** 构造调用了插件工具的 exec；引擎按 options 决定挂在谁的作用域上。 */
-function stubExec(ctx, signal = new AbortController().signal) {
-  return { agent: { id: 'parent', ctx }, signal }
+/**
+ * 构造调用了插件工具的 exec。
+ *
+ * `header` は呼び出し元のセッションヘッダ。プラグインはこれで「人間と対話する
+ * トップレベルか、サブエージェントか」を判定し、実行モードの既定を分ける
+ * （サブエージェントは origin:'subagent' と delegationDepth>=1 を持つ）。
+ *
+ * @param ctx 親エージェントの ctx
+ * @param signal 呼び出し元の中断信号
+ * @param header セッションヘッダ（省略時はトップレベル扱い）
+ */
+function stubExec(ctx, signal = new AbortController().signal, header = { delegationDepth: 0 }) {
+  return {
+    agent: { id: 'parent', ctx, session: { header } },
+    signal,
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1182,7 +1195,7 @@ test('⑫ ジョブミラー：進捗を写し、中止でき、必ず決着す�
     const stub = stubContext({ report: 'REPORT', review: undefined }, { deferResult: true, jobs })
     mod.apply(stub.ctx, {})
     const exec = stubExec(stub.ctx)
-    const pending = stubDefsExecute(stub, { topic: 'テスト主題', depth: 1, questions: '1. Q1' }, exec)
+    const pending = stubDefsExecute(stub, { topic: 'テスト主題', depth: 1, questions: '1. Q1', run_in_background: false }, exec)
 
     // run の起動直後（run.id 確定後）にイベントが来る、という実機の順序を再現する。
     await Promise.resolve()
@@ -1218,7 +1231,7 @@ test('⑫ ジョブミラー：進捗を写し、中止でき、必ず決着す�
     const { jobs, started } = stubJobs()
     const stub = stubContext({ report: 'R' }, { deferResult: true, jobs })
     mod.apply(stub.ctx, {})
-    const pending = stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1' }, stubExec(stub.ctx))
+    const pending = stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1', run_in_background: false }, stubExec(stub.ctx))
     await Promise.resolve()
 
     const signal = stub.requests[0].signal
@@ -1237,7 +1250,7 @@ test('⑫ ジョブミラー：進捗を写し、中止でき、必ず決着す�
     const { jobs, started } = stubJobs()
     const stub = stubContext({ report: 'R' }, { deferResult: true, jobs })
     mod.apply(stub.ctx, {})
-    const pending = stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1' }, stubExec(stub.ctx))
+    const pending = stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1', run_in_background: false }, stubExec(stub.ctx))
     await Promise.resolve()
     stub.engineControl.resolve(undefined, 'error')
     await assert.rejects(pending, /workflow run error/)
@@ -1249,7 +1262,7 @@ test('⑫ ジョブミラー：進捗を写し、中止でき、必ず決着す�
   {
     const stub = stubContext({ report: 'R' })
     mod.apply(stub.ctx, {})
-    const out = await stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1' }, stubExec(stub.ctx))
+    const out = await stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1', run_in_background: false }, stubExec(stub.ctx))
     assert.strictEqual(out.ok, true, 'jobs 無しでも研究は成功する')
     assert.ok(!('jobId' in out), 'jobs が無いときは jobId を付けない')
     assert.strictEqual(stub.requests[0].signal.aborted, false, 'exec.signal をそのまま渡す')
@@ -1774,9 +1787,13 @@ test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直�
   }
 
   // (g) 進捗はジョブへ直接流れる（workflow/* イベントに依存しない）。
+  // run_in_background:false を明示する。トップレベルの既定は背景になったので、
+  // 前景の戻り値（ok / report）を検証するには明示が要る。前景でもジョブは作られ、
+  // そこへ進捗が流れることを見る。
   {
     const { jobs, started } = stubJobs()
-    const { out } = await runMode([{ text: evidence(['事実J']) }], {}, {}, jobs)
+    const { out } = await runMode([{ text: evidence(['事実J']) }], {}, { run_in_background: false }, jobs)
+    assert.strictEqual(out.kind, 'foreground', '明示 false で前景')
     assert.strictEqual(out.ok, true)
     assert.strictEqual(out.jobId, 'job-1', 'jobId を返す')
     assert.strictEqual(started.length, 1, 'ジョブを 1 つ作る')
@@ -1972,23 +1989,75 @@ test('⑰ run_in_background：即座に返し、ターン終了で死なず、jo
     )
   }
 
-  // (f) 既定（run_in_background なし）は前景のまま。既存の挙動を変えない。
+  // (f) 既定は呼び出し元の立場で決まる。
+  //
+  // トップレベル（人間と対話する立場）は背景。前景だとターンが塞がり、人間が
+  // 話しかけられず中止もできない（実測 3時間15分）。サブエージェントは前景。
+  // レポートを自分の答えとして必要とするので、背景で投げると job id だけ
+  // 受け取ってターンが終わり、成果が届かない。
   {
-    const farm = makeFarm()
-    const { jobs } = stubJobs()
-    const stub = stubContext({ report: 'r' }, { jobs, subagents: farm.subagents, agents: farm.agents })
-    mod.apply(stub.ctx, { researchMode: 'continuable' })
-    const exec = stubExec(stub.ctx)
-    // synthesize:false で三態証拠をそのまま返させる（合成を挟むと、fake の子が
-    // 同じ出力を返すため合成結果も同じ文字列になり、証拠の検証にならない）。
-    const pending = stubDefsExecute(stub, {
-      topic: 'テスト', depth: 1, questions: '1. Q', synthesize: false,
-    }, exec)
-    farm.resolveHold()
-    const out = await pending
-    assert.strictEqual(out.kind, 'foreground', '既定は前景')
-    assert.strictEqual(out.ok, true, '研究結果をそのまま返す')
-    assert.ok(out.report.includes('確認できた事実'), '三態証拠のレンダリングが入っている')
+    /** 立場を決めて 1 回走らせる（run_in_background を渡さない）。 */
+    const runAs = async (header, extra = {}) => {
+      const farm = makeFarm()
+      const { jobs } = stubJobs()
+      const stub = stubContext({ report: 'r' }, { jobs, subagents: farm.subagents, agents: farm.agents })
+      mod.apply(stub.ctx, { researchMode: 'continuable' })
+      // synthesize:false で三態証拠をそのまま返させる（合成を挟むと、fake の子が
+      // 同じ出力を返すため検証にならない）。
+      const pending = stubDefsExecute(stub, {
+        topic: 'テスト', depth: 1, questions: '1. Q', synthesize: false, ...extra,
+      }, stubExec(stub.ctx, undefined, header))
+      farm.resolveHold()
+      return { out: await pending, stub }
+    }
+
+    // トップレベル → 背景（ターンを塞がない）
+    {
+      const { out } = await runAs({ delegationDepth: 0 })
+      assert.strictEqual(out.kind, 'background', 'トップレベルは既定で背景（人間が話しかけられる）')
+      assert.strictEqual(out.jobId, 'job-1', 'jobId を返す')
+    }
+
+    // サブエージェント（origin で判定） → 前景（レポートを返す）
+    {
+      const { out } = await runAs({ origin: 'subagent', delegationDepth: 1 })
+      assert.strictEqual(out.kind, 'foreground', 'サブエージェントは既定で前景')
+      assert.strictEqual(out.ok, true, '研究結果をそのまま返す')
+      assert.ok(out.report.includes('確認できた事実'), '三態証拠のレンダリングが入っている')
+    }
+
+    // サブエージェント（depth だけで判定） → 前景
+    {
+      const { out } = await runAs({ delegationDepth: 2 })
+      assert.strictEqual(out.kind, 'foreground', 'depth>=1 でも前景と判定する')
+    }
+
+    // 明示すれば立場に勝つ: サブエージェントでも背景を選べる
+    {
+      const { out } = await runAs({ origin: 'subagent', delegationDepth: 1 }, { run_in_background: true })
+      assert.strictEqual(out.kind, 'background', '明示 true は立場より優先される')
+    }
+
+    // 明示すれば立場に勝つ: トップレベルでも前景を選べる（同じターンで結果を得る）
+    {
+      const { out } = await runAs({ delegationDepth: 0 }, { run_in_background: false })
+      assert.strictEqual(out.kind, 'foreground', '明示 false は立場より優先される')
+      assert.strictEqual(out.ok, true, '結果をその場で返す')
+    }
+
+    // jobs が無い構成では、既定は前景に落ちる（背景という能力が無いため）。
+    // ただし明示要求は黙って落とさない（既存のテスト (e) が担保）。
+    {
+      const farm = makeFarm()
+      const stub = stubContext({ report: 'r' }, { subagents: farm.subagents, agents: farm.agents })
+      mod.apply(stub.ctx, { researchMode: 'continuable' })
+      const pending = stubDefsExecute(stub, {
+        topic: 'テスト', depth: 1, questions: '1. Q', synthesize: false,
+      }, stubExec(stub.ctx, undefined, { delegationDepth: 0 }))
+      farm.resolveHold()
+      const out = await pending
+      assert.strictEqual(out.kind, 'foreground', 'jobs が無ければ前景に落ちる（能力の欠如）')
+    }
   }
 
   // (g) 引数不正は、ジョブを作る前に弾く（決着しない幽霊ジョブを残さない）。
