@@ -108,6 +108,28 @@ export interface Config {
      * 実機で確かめるための使い捨て経路。検証が終わったらこのフラグごと削除する。
      */
     poc?: boolean;
+    /**
+     * `deep_research` の実行経路（既定は `'workflow'`）。
+     *
+     * - `'workflow'`   : 公式 workflow エンジン。安定・実績あり。ただし子は
+     *                    one-shot なので、**実行中に人間が研究者へ注文できない**。
+     * - `'continuable'`: ホストが continuable な子を直接回す。研究者が常駐するので
+     *                    UI の Steer / `send_message` が `next-step` で届く（実測済み）。
+     *                    代償として outputSchema が使えず、出力は
+     *                    `recoverStructuredOutput` で回収・検証する。
+     *
+     * 既定を `'workflow'` にしているのは、新しい経路が「追加の検証で目的を達成した」
+     * と確認できるまでの安全側の選択。
+     */
+    researchMode?: 'workflow' | 'continuable';
+    /**
+     * `researchMode: 'continuable'` のとき、構造化出力の回収に失敗した子を
+     * 何回まで作り直すか（既定 1 = 最大 2 回試行）。
+     *
+     * ローカルでは 1 回の再試行が数分の追加コストになるため、0（再試行しない）も
+     * 選べる。検証は緩めないので、失敗した子の結果は下流に混ざらない。
+     */
+    continuableRetries?: number;
 }
 /** Planner structured output: answer space + dimension coverage + questions. */
 export declare const PLANNER_SCHEMA: {
@@ -262,6 +284,7 @@ export declare function checkSchema(schema: unknown, value: unknown, path?: stri
 export declare function recoverStructuredOutput(events: readonly unknown[], schema: unknown): {
     ok: true;
     value: Record<string, unknown>;
+    text: string;
 } | {
     ok: false;
     errors: string[];

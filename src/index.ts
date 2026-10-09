@@ -115,6 +115,28 @@ export interface Config {
    * 実機で確かめるための使い捨て経路。検証が終わったらこのフラグごと削除する。
    */
   poc?: boolean
+  /**
+   * `deep_research` の実行経路（既定は `'workflow'`）。
+   *
+   * - `'workflow'`   : 公式 workflow エンジン。安定・実績あり。ただし子は
+   *                    one-shot なので、**実行中に人間が研究者へ注文できない**。
+   * - `'continuable'`: ホストが continuable な子を直接回す。研究者が常駐するので
+   *                    UI の Steer / `send_message` が `next-step` で届く（実測済み）。
+   *                    代償として outputSchema が使えず、出力は
+   *                    `recoverStructuredOutput` で回収・検証する。
+   *
+   * 既定を `'workflow'` にしているのは、新しい経路が「追加の検証で目的を達成した」
+   * と確認できるまでの安全側の選択。
+   */
+  researchMode?: 'workflow' | 'continuable'
+  /**
+   * `researchMode: 'continuable'` のとき、構造化出力の回収に失敗した子を
+   * 何回まで作り直すか（既定 1 = 最大 2 回試行）。
+   *
+   * ローカルでは 1 回の再試行が数分の追加コストになるため、0（再試行しない）も
+   * 選べる。検証は緩めないので、失敗した子の結果は下流に混ざらない。
+   */
+  continuableRetries?: number
 }
 
 /** Planner structured output: answer space + dimension coverage + questions. */
@@ -717,6 +739,71 @@ export function apply(ctx: Context, config: Config = {}) {
       if (synthesizerModel !== undefined) models.synthesizer = synthesizerModel
       if (reviewerModel !== undefined) models.reviewer = reviewerModel
 
+      const researchMode = config.researchMode === 'continuable' ? 'continuable' : 'workflow'
+      const continuableRetries = config.continuableRetries === undefined
+        ? 1
+        : Math.max(0, Math.floor(config.continuableRetries))
+
+      // どの経路でもジョブを決着させる（常駐したままのジョブを残さない）。
+      const finishJob = (outcome: JobOutcomeLike): void => {
+        if (job === undefined) return
+        job.updateProgress(outcome.status === 'completed'
+          ? '完了'
+          : '終了: ' + String(outcome.detail ?? outcome.status))
+        if (settleJob !== undefined) settleJob(outcome)
+      }
+
+      // ── continuable 経路（実行中に人間が研究者へ注文できる） ──
+      //
+      // エンジンを使わないので、`workflow/*` イベントは来ない。進捗は jobProgress で
+      // 直接ジョブへ書く。signal は job_kill と exec.signal の両方に反応させる。
+      if (researchMode === 'continuable') {
+        const subagents = (parent.ctx.get('subagents') ?? ctx.get('subagents')) as SubagentsForChildrenLike | undefined
+        const agents = (parent.ctx.get('agents') ?? ctx.get('agents')) as AgentsLookupLike | undefined
+        if (subagents === undefined || agents === undefined) {
+          finishJob({ status: 'failed', detail: 'no subagents/agents service' })
+          throw new Error('deep_research: researchMode "continuable" requires the `subagents` and `agents` services')
+        }
+        const progress = job === undefined ? silentProgress() : jobProgress(job)
+        progress.log('研究を開始（continuable: 実行中に UI から研究者へ指示できます）')
+        try {
+          const out = await runContinuableResearch({
+            subagents,
+            agents,
+            parent,
+            signal: exec.signal instanceof AbortSignal
+              ? AbortSignal.any([exec.signal, controller.signal])
+              : controller.signal,
+            provider: subagentProvider ?? 'spawn',
+            progress,
+            retries: continuableRetries,
+          }, {
+            topic,
+            ...(purpose !== undefined ? { purpose } : {}),
+            ...(questions.length > 0 ? { questions } : {}),
+            depth,
+            synthesize,
+            review,
+            maxParallel,
+            maxQuestions,
+            maxFollowUps,
+            researcherRounds,
+            ...(Object.keys(models).length > 0 ? { models } : {}),
+          })
+          finishJob({ status: 'completed', result: '研究が完了しました（詳細はツール結果を参照）' })
+          return {
+            ok: true,
+            report: out.report,
+            ...(out.review !== undefined ? { review: out.review } : {}),
+            ...(jobId !== undefined ? { jobId } : {}),
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          finishJob({ status: 'failed', detail: message })
+          throw error
+        }
+      }
+
       const run = workflowEngine.start({
         script: SCRIPT,
         meta: {
@@ -777,13 +864,6 @@ export function apply(ctx: Context, config: Config = {}) {
       // `run.result` は reject しない（失敗は stopReason 'error'/'cancelled' として
       // 解決する）ので、throw しうるのは以下の検証だけ。どの経路でもジョブを
       // 決着させて、常駐したままのジョブを残さない。
-      const finishJob = (outcome: JobOutcomeLike): void => {
-        if (job === undefined) return
-        job.updateProgress(outcome.status === 'completed'
-          ? '完了'
-          : '終了: ' + String(outcome.detail ?? outcome.status))
-        if (settleJob !== undefined) settleJob(outcome)
-      }
       if (result.stopReason !== 'completed') {
         finishJob({ status: 'failed', detail: String(result.stopReason) })
         throw new Error(`deep_research: workflow run ${result.stopReason}${result.error !== undefined ? ` (${result.error})` : ''}`)
@@ -809,6 +889,512 @@ export function apply(ctx: Context, config: Config = {}) {
   }))
 
   if (config.poc === true) registerPocTool(ctx)
+}
+
+// ── continuable オーケストレータ（実行中に介入できる研究） ────────────────────
+//
+// なぜ別経路なのか: workflow エンジンが作る研究者は one-shot で、実行中に
+// 人間の指示を届けられない（実測で確認: 子のプロンプトに親への send_message
+// 指示が無く、`next-step` への挿入も起きない）。continuable な子なら
+// `next-step` で割り込みが届く（実測で確認済み）。
+//
+// エンジンを使わない代償は3つあり、いずれもフェーズ0で手当て済み:
+//   1. outputSchema が無い → recoverStructuredOutput で回収し、失敗は失敗として扱う
+//   2. 進捗イベントが無い   → ジョブへ直接書く（workflow/* の購読に依存しない）
+//   3. 常駐枠の上限         → 各子を drainContinuableChildren で破棄して解放
+//                             （実機で9体連続成功を確認。上限8を超えられる）
+
+/** 子ハンドルの、この経路が使う範囲。 */
+interface ContinuableChildLike {
+  whenIdle(): Promise<void>
+  session: { snapshotEvents(fromSeq?: unknown): readonly unknown[] }
+}
+interface AgentsLookupLike {
+  get(childId: string): unknown
+}
+interface SubagentsForChildrenLike {
+  startContinuable(spec: {
+    provider: string
+    label: string
+    request: { prompt: unknown[]; parent: unknown; agentOptions?: Record<string, unknown> }
+    signal: AbortSignal
+  }): Promise<{ childId: string }>
+  drainContinuableChildren(parent: unknown, childIds: string[]): Promise<void>
+}
+
+/** 進捗の行き先。ジョブが無いときは何もしない実装を渡す。 */
+interface ProgressSink {
+  phase(title: string): void
+  childStart(label: string): void
+  childEnd(label: string, outcome: string): void
+  log(message: string): void
+}
+
+/** 進捗を捨てる実装（ジョブが無い構成）。 */
+function silentProgress(): ProgressSink {
+  return {
+    phase: () => void 0,
+    childStart: () => void 0,
+    childEnd: () => void 0,
+    log: () => void 0,
+  }
+}
+
+/** ジョブへ直接書く進捗。workflow/* を経由しないので、エンジン無しでも見える。 */
+function jobProgress(job: JobHandleLike): ProgressSink {
+  let seq = 0
+  return {
+    phase: (title) => {
+      job.append('== ' + title + ' ==\n')
+      job.updateProgress(title)
+    },
+    childStart: (label) => {
+      seq += 1
+      job.append('  > #' + seq + ' ' + label + ' 開始\n')
+      job.updateProgress(label)
+    },
+    childEnd: (label, outcome) => {
+      job.append('  v ' + label + ' ' + outcome + '\n')
+    },
+    log: (message) => { job.append(message + '\n') },
+  }
+}
+
+/**
+ * 子に渡す「JSON だけを出せ」という指示。
+ *
+ * outputSchema が使えないので、スキーマは文章として渡すしかない。曖昧さは
+ * 抽出失敗に直結するため、キー名・型・許される値・必須を明示する。
+ */
+function schemaAsInstructions(schema: unknown): string {
+  const s = schema as { properties?: Record<string, unknown>; required?: unknown } | undefined
+  const props = s?.properties ?? {}
+  const required = Array.isArray(s?.required) ? s.required.map(String) : []
+  const describe = (node: unknown, depth: number): string => {
+    const n = node as { type?: unknown; items?: unknown; enum?: unknown; properties?: unknown; required?: unknown } | undefined
+    const t = String(n?.type ?? 'any')
+    if (Array.isArray(n?.enum)) return '取值之一: ' + n.enum.map((v) => JSON.stringify(v)).join(' / ')
+    if (t === 'array') {
+      const inner = t
+      if (depth > 2) return '数组'
+      return '数组，每项: ' + describe(n?.items, depth + 1)
+    }
+    if (t === 'object' && depth <= 2) {
+      const sub = Object.entries((n?.properties ?? {}) as Record<string, unknown>)
+        .map(([k, value]) => '      - ' + k + ': ' + describe(value, depth + 1))
+        .join('\n')
+      return '对象，键:\n' + sub
+    }
+    return t
+  }
+  const lines = Object.entries(props).map(([key, node]) => {
+    const req = required.includes(key) ? '（必须）' : '（可选）'
+    return '  - ' + key + req + ': ' + describe(node, 1)
+  })
+  return 'JSON 的键（只允许这些键，不要增加）:\n' + lines.join('\n')
+}
+
+/** 研究者 1 体ぶんのプロンプト（continuable 用。JSON 出力を明示する）。 */
+function continuableResearcherPrompt(
+  topic: string,
+  q: { question: string; dimension?: string; keywords?: string; acceptance?: string; blind?: boolean },
+  round: number,
+  limit: number,
+  isFollowUp: boolean,
+): string {
+  const header = isFollowUp
+    ? '这是第 ' + round + ' 轮补充研究，针对上一轮暴露的高优先级信息缺口：'
+    : (q.blind
+      ? '这是对规划阶段"盲区假设"的定向侦察：验证以下方面是否真的缺乏公开信息（若确实没有，明确写进 gaps，不要勉强编造）：'
+      : '你的子问题：')
+  return '你是深度研究子代理。你的任务不是"尽可能多搜索"，而是以最大信息增益为准则，'
+    + '把对该子问题的条件不确定性降到可接受水平，然后立即停止。\n\n'
+    + '研究主题：' + topic + '\n' + header + q.question
+    + (q.dimension !== undefined && q.blind !== true ? '\n所属维度：' + q.dimension : '')
+    + (q.keywords !== undefined ? '\n搜索关键词线索：' + q.keywords : '')
+    + (q.acceptance !== undefined ? '\n验收标准（怎样算回答完成）：' + q.acceptance : '')
+    + '\n\n用内置的 web_search 工具搜索（若工具集中有 web_fetch，必要时抓取具体页面）。不要使用除 web_search / web_fetch 以外的工具。'
+    + '\n\n感知-行动循环：\n'
+    + '第 0 步：写出当前最佳答案（哪怕不完整）。\n'
+    + '第 1 步【预测】：列出最不确定的 1-3 个高熵点，为下一个查询选预期信息增益最高者，并写明：针对哪个高熵点、预期新增什么、若结果相反会如何改变答案。\n'
+    + '第 2 步【行动】：执行该查询（中英文关键词都试）。\n'
+    + '第 3 步【更新】：把证据归入三态——confirmed（有可靠来源支撑）/ uncertain（来源弱或矛盾）/ gaps（仍未获得，标注优先级）。\n'
+    + '第 4 步【边际增益】：本轮是否新增 confirmed？是否推翻或改变了结论？\n\n'
+    + '停止准则（满足其一即停）：上一轮边际增益为零；高优先级缺口清空；达到轮次硬上限（最多 ' + limit + ' 轮）。\n\n'
+    + '来源评估：权威性（政府/学术/行业机构优先）、时效性（近3年优先）、可靠性。'
+    + '只列你实际访问过的来源。宁可不确认，也不要编造——无法确认的放进 uncertain 或 gaps。\n\n'
+    + '【重要】你可以随时收到人类或父代理的追加指示。收到后必须按其调整研究方向。\n\n'
+    + '【输出格式】完成研究后，只输出一个 JSON 对象，不要输出任何其他文字、说明或 Markdown 代码块：\n'
+    + schemaAsInstructions(RESEARCHER_SCHEMA)
+    + '\n\nconfidence 与 priority 只能取 high / medium / low。'
+}
+
+/** 計画子のプロンプト（continuable 用）。 */
+function continuablePlannerPrompt(topic: string, purpose: string | undefined, questionCap: number): string {
+  return '你是深度研究规划代理。研究的第一步是定义问题本身：先界定答案空间，再按信息维度拆解子问题。\n\n'
+    + '研究主题：' + topic
+    + (purpose !== undefined ? '\n研究用途（要支撑的决策/判断）：' + purpose : '')
+    + '\n\n请按以下顺序工作：\n'
+    + '1. 【答案空间】用一句话界定 scope。\n'
+    + '2. 【信息维度】枚举主题空间的信息维度，这是后续覆盖度检查的基准。\n'
+    + '3. 【多样性拆解】每个维度至少一个子问题；每个子问题给出所属维度、搜索关键词线索、验收标准。\n'
+    + '   **子问题总数上限：' + questionCap + ' 条**（本地推理逐条研究，每条约7分钟）。'
+    + '按重要度排序，超出上限的维度改列入 coverage_gaps。\n'
+    + '4. 【覆盖度假设】列出 coverage_gaps。\n\n'
+    + '【输出格式】只输出一个 JSON 对象，不要输出任何其他文字或 Markdown 代码块：\n'
+    + schemaAsInstructions(PLANNER_SCHEMA)
+}
+
+/** 統合・審査のプロンプト（continuable 用。JSON ではなく本文を返す）。 */
+interface ContinuableRunInput {
+  goal: 'plan' | 'research' | 'synthesize' | 'review'
+  topic: string
+  purpose?: string
+  planText?: string
+  prompt: string
+  schema?: unknown
+  model?: string
+  label: string
+}
+
+interface ContinuableRunResult {
+  ok: boolean
+  text: string
+  value?: Record<string, unknown>
+  childId: string
+  errors: string[]
+}
+
+/**
+ * 子を 1 体作り、完了を待ち、出力を取り出し、**必ず破棄する**。
+ *
+ * 破棄は `finally` で行う。エラーで抜けても常駐枠を占有したままにしない
+ * （枠は 8 しかなく、漏れると以降の研究が起動できなくなる）。
+ * `structured` なら JSON を回収して検証する。
+ */
+async function runContinuableChild(
+  deps: {
+    subagents: SubagentsForChildrenLike
+    agents: AgentsLookupLike
+    parent: unknown
+    signal: AbortSignal
+    provider: string
+    progress: ProgressSink
+    retries: number
+  },
+  input: ContinuableRunInput,
+  structured: boolean,
+): Promise<ContinuableRunResult> {
+  const errors: string[] = []
+  const attempts = structured ? Math.max(1, deps.retries + 1) : 1
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const label = input.label + (attempt > 1 ? '（再試行' + attempt + '）' : '')
+    let childId = ''
+    deps.progress.childStart(label)
+    try {
+      const started = await deps.subagents.startContinuable({
+        provider: deps.provider,
+        label,
+        request: {
+          prompt: [{ type: 'text', text: input.prompt }],
+          parent: deps.parent,
+          ...(input.model !== undefined ? { agentOptions: { model: input.model } } : {}),
+        },
+        signal: deps.signal,
+      })
+      childId = String(started.childId)
+      const child = deps.agents.get(childId) as ContinuableChildLike | undefined
+      if (child === undefined) {
+        deps.progress.childEnd(label, 'failed (no agent handle)')
+        errors.push('子のハンドルが取得できなかった')
+        continue
+      }
+      await child.whenIdle()
+      const events = child.session.snapshotEvents()
+
+      if (!structured) {
+        const text = extractFinalAssistantText(events)
+        deps.progress.childEnd(label, text.length > 0 ? 'completed' : 'completed (empty)')
+        return { ok: text.length > 0, text, childId, errors }
+      }
+
+      const recovered = recoverStructuredOutput(events, input.schema)
+      if (recovered.ok) {
+        deps.progress.childEnd(label, 'completed')
+        return { ok: true, text: recovered.text, value: recovered.value, childId, errors }
+      }
+      // 検証に落ちた理由は残す。次の試行で同じ失敗を繰り返さないための手掛かり。
+      errors.push(...recovered.errors)
+      deps.progress.childEnd(label, 'invalid (' + recovered.errors[0] + ')')
+      deps.progress.log('  再試行します: ' + recovered.errors.join('; '))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      errors.push(message)
+      deps.progress.childEnd(label, 'error (' + message + ')')
+    } finally {
+      // 常駐枠を必ず返す。失敗した子も残さない。
+      if (childId.length > 0) {
+        try {
+          await deps.subagents.drainContinuableChildren(deps.parent, [childId])
+        } catch (error) {
+          errors.push('解放に失敗: ' + (error instanceof Error ? error.message : String(error)))
+        }
+      }
+    }
+  }
+  return { ok: false, text: '', childId: '', errors }
+}
+
+/**
+ * continuable な子だけで研究を回す（workflow エンジンを使わない経路）。
+ *
+ * 適応ループ（次元の網羅 → 高優先度ギャップによる補充研究 → 自然収束）は
+ * SCRIPT と同じ規則を写している。同時実行は既定 1（ローカルエンジンは
+ * 1 リクエストずつしか処理しないため、増やしても後ろが待つだけ）。
+ */
+async function runContinuableResearch(
+  deps: {
+    subagents: SubagentsForChildrenLike
+    agents: AgentsLookupLike
+    parent: unknown
+    signal: AbortSignal
+    provider: string
+    progress: ProgressSink
+    retries: number
+  },
+  args: {
+    topic: string
+    purpose?: string
+    questions?: { question: string; dimension?: string; keywords?: string; acceptance?: string; blind?: boolean }[]
+    depth: number
+    synthesize: boolean
+    review: boolean
+    maxParallel: number
+    maxQuestions: number
+    maxFollowUps: number
+    researcherRounds: number
+    models?: Record<string, string>
+  },
+): Promise<{
+  report: string
+  review?: string
+  rounds: number
+  subquestions: number
+  completed: number
+  failed: number
+}> {
+  const { progress } = deps
+  const M = args.models ?? {}
+  const limit = args.depth === 1 ? 1 : (args.researcherRounds || 2)
+  const concurrency = Math.max(1, args.maxParallel || 1)
+  const followUpCap = Math.max(1, args.maxFollowUps || 2)
+  const questionCap = Math.max(1, args.maxQuestions || 8)
+
+  // ── 計画 ──
+  progress.phase('规划')
+  let subs = args.questions !== undefined && args.questions.length > 0 ? args.questions : null
+  let planText = ''
+  if (subs !== null && subs.length > questionCap) {
+    planText = '（呼び出し側の子問題 ' + subs.length + ' 件を、ローカル実行のため ' + questionCap + ' 件に絞った）'
+    subs = subs.slice(0, questionCap)
+  }
+  if (subs === null) {
+    const planned = await runContinuableChild(deps, {
+      goal: 'plan',
+      topic: args.topic,
+      ...(args.purpose !== undefined ? { purpose: args.purpose } : {}),
+      prompt: continuablePlannerPrompt(args.topic, args.purpose, questionCap),
+      schema: PLANNER_SCHEMA,
+      ...(M.planner !== undefined ? { model: M.planner } : {}),
+      label: '规划',
+    }, true)
+    if (!planned.ok || planned.value === undefined) {
+      throw new Error('规划子代理未返回有效子问题' + (planned.errors.length > 0 ? ': ' + planned.errors.join('; ') : ''))
+    }
+    const plan = planned.value
+    const questions = Array.isArray(plan.questions) ? plan.questions as { question: string; dimension?: string; keywords?: string; acceptance?: string }[] : []
+    if (questions.length === 0) throw new Error('规划子代理未返回有效子问题')
+    subs = questions
+    const dims = Array.isArray(plan.dimensions) ? plan.dimensions.map(String) : []
+    const gaps = Array.isArray(plan.coverage_gaps) ? plan.coverage_gaps.map(String) : []
+    planText = '研究答案空间：' + (typeof plan.scope === 'string' ? plan.scope : '（未声明）')
+      + '\n覆盖维度：' + (dims.length > 0 ? dims.join('、') : '（未声明）')
+      + (gaps.length > 0 ? '\n规划假设的盲区（待验证）：' + gaps.join('、') : '')
+    // 盲区侦察も研究キューに入れる（SCRIPT と同じ規則）。
+    const room = Math.max(1, questionCap - subs.length)
+    subs = subs.concat(gaps.slice(0, room).map((g) => ({ question: g, dimension: '盲区侦察', blind: true })))
+    if (subs.length > questionCap) {
+      planText += '\n（ローカル実行のため子問題を ' + questionCap + ' 件に絞った。元 ' + subs.length + ' 件）'
+      subs = subs.slice(0, questionCap)
+    }
+  }
+
+  // ── 研究（適応ループ） ──
+  const results = new Map<string, Record<string, unknown>>()
+  const rounds: { q: { question: string }; value?: Record<string, unknown> }[][] = []
+  let pending = subs.slice()
+  let round = 0
+  while (pending.length > 0 && round < args.depth + 1) {
+    round += 1
+    progress.phase('研究·第' + round + '轮')
+    const batch = pending.slice()
+    const found: (Record<string, unknown> | undefined)[] = []
+    for (let start = 0; start < batch.length; start += concurrency) {
+      const chunk = batch.slice(start, start + concurrency)
+      const got = await Promise.all(chunk.map((q, i) => runContinuableChild(deps, {
+        goal: 'research',
+        topic: args.topic,
+        prompt: continuableResearcherPrompt(args.topic, q, round, limit, round > 1),
+        schema: RESEARCHER_SCHEMA,
+        ...(M.researcher !== undefined ? { model: M.researcher } : {}),
+        label: '研究' + (start + i + 1) + '·第' + round + '轮',
+      }, true)))
+      for (let i = 0; i < chunk.length; i += 1) found[start + i] = got[i].ok ? got[i].value : undefined
+    }
+    batch.forEach((q, i) => {
+      if (found[i] !== undefined) results.set(q.question, found[i] as Record<string, unknown>)
+    })
+    rounds.push(batch.map((q, i) => ({ q, ...(found[i] !== undefined ? { value: found[i] } : {}) })))
+
+    // 収束評価: 高優先度ギャップを次ラウンドの補充研究にする（上限 followUpCap）。
+    const leads: { question: string }[] = []
+    const seen = new Set<string>()
+    for (const item of batch) {
+      const f = results.get(item.question)
+      const gaps = f?.gaps
+      if (!Array.isArray(gaps)) continue
+      for (const raw of gaps) {
+        const g = raw as { aspect?: unknown; priority?: unknown }
+        if (g.priority !== 'high' || typeof g.aspect !== 'string') continue
+        if (seen.has(g.aspect) || leads.length >= followUpCap) continue
+        seen.add(g.aspect)
+        leads.push({ question: g.aspect })
+      }
+    }
+    pending = leads
+  }
+
+  // ── 証拠の整理 ──
+  const ordered: { q: { question: string }; value?: Record<string, unknown> }[] = []
+  const seenQ = new Set<string>()
+  for (const batch of rounds) {
+    for (const item of batch) {
+      if (seenQ.has(item.q.question)) continue
+      seenQ.add(item.q.question)
+      ordered.push(item)
+    }
+  }
+  const parts: string[] = []
+  let okCount = 0
+  for (const { q, value } of ordered) {
+    if (value !== undefined) okCount += 1
+    parts.push(value !== undefined
+      ? renderFindingsText(q.question, value)
+      : '## ' + q.question + '\n\n> 该子问题研究失败（子代理未返回有效证据）')
+  }
+  const totalRounds = rounds.length
+  const intermediate = '# ' + args.topic + ' — 深度研究中间结果（证据状态）\n\n> 子问题 ' + ordered.length
+    + ' 个，完成 ' + okCount + ' 个，研究轮次 ' + totalRounds + ' 轮。'
+    + (planText ? '\n\n' + planText : '') + '\n\n' + parts.join('\n\n---\n\n')
+
+  // ── 統合 ──
+  let report = intermediate
+  if (args.synthesize) {
+    progress.phase('综合')
+    const final = await runContinuableChild(deps, {
+      goal: 'synthesize',
+      topic: args.topic,
+      ...(args.purpose !== undefined ? { purpose: args.purpose } : {}),
+      prompt: synthesisPrompt(args.topic, args.purpose, planText, intermediate),
+      ...(M.synthesizer !== undefined ? { model: M.synthesizer } : {}),
+      label: '综合',
+    }, false)
+    if (final.ok) {
+      report = final.text
+        + '\n\n---\n\n> 证据状态：子问题 ' + ordered.length + ' 个，完成 ' + okCount + ' 个'
+        + (ordered.length > okCount ? '，失败 ' + (ordered.length - okCount) + ' 个' : '')
+        + '；研究轮次 ' + totalRounds + ' 轮。每个子问题的三态证据（confirmed / uncertain / gaps）'
+        + '保存在对应研究子代理的会话里，需要细节时可直接查看该子代理的对话，本报告不重复列出。'
+    }
+  }
+
+  // ── 審査 ──
+  let reviewText: string | undefined
+  if (args.review) {
+    progress.phase('审查')
+    const reviewed = await runContinuableChild(deps, {
+      goal: 'review',
+      topic: args.topic,
+      prompt: reviewPrompt(args.topic, planText, report),
+      ...(M.reviewer !== undefined ? { model: M.reviewer } : {}),
+      label: '审查',
+    }, false)
+    if (reviewed.ok) reviewText = '## 对抗性审查意见\n\n' + reviewed.text
+  }
+
+  return {
+    report,
+    ...(reviewText !== undefined ? { review: reviewText } : {}),
+    rounds: totalRounds,
+    subquestions: ordered.length,
+    completed: okCount,
+    failed: ordered.length - okCount,
+  }
+}
+
+/** 証拠 1 件を Markdown にする（SCRIPT の renderFindings と同じ規則）。 */
+function renderFindingsText(question: string, f: Record<string, unknown>): string {
+  const label = (c: unknown): string => (c === 'high' ? '高' : c === 'medium' ? '中' : c === 'low' ? '低' : '中')
+  const lines = ['## ' + question, '']
+  const confirmed = Array.isArray(f.confirmed) ? f.confirmed : []
+  const uncertain = Array.isArray(f.uncertain) ? f.uncertain : []
+  const gaps = Array.isArray(f.gaps) ? f.gaps : []
+  if (confirmed.length > 0) {
+    lines.push('### 已确认事实（置信度）')
+    for (const raw of confirmed) {
+      const item = raw as { claim?: unknown; confidence?: unknown; source?: unknown }
+      lines.push('- ' + String(item.claim) + '（置信度：' + label(item.confidence) + '，来源：' + String(item.source) + '）')
+    }
+  }
+  if (uncertain.length > 0) {
+    lines.push('### 不确定项')
+    for (const raw of uncertain) {
+      const item = raw as { point?: unknown; reason?: unknown }
+      lines.push('- ' + String(item.point) + (item.reason !== undefined ? '（原因：' + String(item.reason) + '）' : ''))
+    }
+  }
+  if (gaps.length > 0) {
+    lines.push('### 信息缺口（优先级）')
+    for (const raw of gaps) {
+      const item = raw as { aspect?: unknown; priority?: unknown }
+      lines.push('- ' + String(item.aspect) + '（优先级：' + label(item.priority) + '）')
+    }
+  }
+  if (confirmed.length === 0) lines.push('（该子问题未获得任何可确认的证据）')
+  return lines.join('\n')
+}
+
+function synthesisPrompt(topic: string, purpose: string | undefined, planText: string, intermediate: string): string {
+  return '你是顶级行业分析师。你的产出是一次"有损压缩"：在报告长度（率）约束下，只保留对最终结论有区分度的信息，最大化决策有用性（最小化失真）。\n\n'
+    + '报告主题：' + topic
+    + (purpose !== undefined ? '\n研究用途（要支撑的决策/判断）：' + purpose : '')
+    + (planText ? '\n' + planText : '')
+    + '\n\n报告结构：\n## 摘要（3-5 句核心结论，含整体置信度评估）\n## 1. 背景\n## 2. 核心发现（按维度组织，每条附置信度与来源引用）\n## 3. 不确定性与矛盾（明确列出：哪些结论置信度低、哪些来源相互矛盾——不确定性本身就是重要信息，必须保留而非掩盖）\n## 4. 信息缺口与已验证盲区（规划假设的盲区经研究验证后的真实状态）\n## 5. 结论与建议（给出基于现有证据的最优判断，标注证据强度）\n## 6. 参考资料'
+    + '\n\n要求：所有关键信息行内引用来源 URL；区分事实（高置信）与推断（低置信）；矛盾信息要并列呈现；用表格/对比呈现适合的数据；避免泛泛而谈；中文输出，Markdown 格式；证据不足处明确说明，不要编造。\n'
+    + '**长度约束（重要）**：这是"有损压缩"，不是资料汇编。目标 1,500〜3,000 字；每个论点 1〜3 句；能进表格的不要写成段落；引用只列 URL，不要复述来源内容；不要重复证据细节。宁可短而可判断，不要长而稀释。\n\n以下是研究发现：\n\n' + intermediate
+}
+
+function reviewPrompt(topic: string, planText: string, report: string): string {
+  return '你是研究审阅代理。你的角色是信道纠错：对报告做对抗性审查，找出证据链中的噪声与错误。若工具集中有 web_fetch，可抽查可疑来源 URL 是否真实可达、内容是否支撑引用。\n\n'
+    + '审查维度：\n'
+    + '1. 引用纠错：URL 无法访问或与结论无关？引用是否支撑对应观点？（幻觉来源 = 信道噪声，必须标出）\n'
+    + '2. 覆盖度审计：对照规划声明的信息维度，哪些维度证据不足或完全缺失？\n'
+    + '3. 信息矛盾：不同来源冲突处是否被标注并保留？\n'
+    + '4. 时效性：关键数据是否过时？\n'
+    + '5. 过度自信：是否有低置信结论被表述为确定事实？\n'
+    + (planText ? '\n规划阶段声明：\n' + planText : '')
+    + '\n\n只输出审查意见（Markdown，中文），不要改写报告本身：\n## 审查意见\n### 可疑来源（如有）\n### 覆盖盲区（如有）\n### 信息矛盾\n### 过度自信项\n### 需要补充研究的最高优先级缺口（如有）\n### 总体评估与修正建议\n\n报告主题：' + topic + '\n\n以下是待审查报告：\n\n' + report
 }
 
 // ── 一時的な検証用（config.poc === true のときだけ登録） ─────────────────────
@@ -1044,7 +1630,7 @@ export function checkSchema(schema: unknown, value: unknown, path = '$'): string
 export function recoverStructuredOutput(
   events: readonly unknown[],
   schema: unknown,
-): { ok: true; value: Record<string, unknown> } | { ok: false; errors: string[]; text: string } {
+): { ok: true; value: Record<string, unknown>; text: string } | { ok: false; errors: string[]; text: string } {
   const text = extractFinalAssistantText(events)
   if (text.length === 0) return { ok: false, errors: ['子が出力を返さなかった'], text }
 
@@ -1058,7 +1644,7 @@ export function recoverStructuredOutput(
 
   const errors = checkSchema(schema, parsed)
   if (errors.length > 0) return { ok: false, errors, text }
-  return { ok: true, value: parsed as Record<string, unknown> }
+  return { ok: true, value: parsed as Record<string, unknown>, text }
 }
 
 /** 子のイベント列から、最後の assistant テキストを取り出す試作。 */

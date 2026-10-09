@@ -1546,3 +1546,181 @@ test('⑮ 構造化出力の回収：頑健に抽出し、厳しく検証し、�
     )
   }
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑯ continuable 経路：実行中に介入できる研究をホストが回す
+//
+// 実測で分かっている前提（フェーズ0）:
+//   - startContinuable → whenIdle で完了が取れる
+//   - 9 体連続で drain しても常駐上限（8）に当たらない
+//   - 子の出力は data.message.content、JSON は recoverStructuredOutput で回収
+//   - 実行中の子へは next-step で割り込みが届く（だから常駐させたまま研究する）
+//
+// ここで固定するのは**オーケストレーションの規則**:
+//   1. 質問ごとに子を 1 体作り、**必ず破棄する**（枠を漏らさない）
+//   2. 構造化出力が不正なら作り直す（回数は continuableRetries）
+//   3. 高優先度ギャップが次のラウンドの補充研究になる（上限 maxFollowUps）
+//   4. 進捗がジョブへ直接流れる（workflow/* に依存しない）
+// ════════════════════════════════════════════════════════════════════════════
+test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直し、ギャップで補充する', async () => {
+  const { mod } = await loadPlugin()
+
+  /** 子の最終出力（実機と同じ data.message.content の形）。 */
+  const said = (text) => ([{
+    type: 'assistant/message',
+    seq: 1,
+    data: { message: { content: [{ type: 'text', text }] } },
+  }])
+  const evidence = (claims) => JSON.stringify({
+    confirmed: claims.map((c) => ({ claim: c, source: 'https://example.com/' + c, confidence: 'high' })),
+    uncertain: [],
+    gaps: [],
+  })
+
+  /**
+   * 子を順に作る fake。`script` は「n 体目が何を返すか」の列。
+   * 各要素は { text } か { throw: message }。
+   */
+  const makeChildFarm = (script) => {
+    let n = 0
+    const started = []
+    const drained = []
+    const prompts = []
+    const subagents = {
+      startContinuable: async (spec) => {
+        const i = n
+        n += 1
+        const step = script[Math.min(i, script.length - 1)]
+        started.push({ index: i, label: spec.label })
+        prompts.push(spec.request.prompt[0].text)
+        return { childId: 'child-' + n }
+      },
+      drainContinuableChildren: async (parent, childIds) => { drained.push(...childIds) },
+    }
+    const agents = {
+      get: (childId) => {
+        const i = Number(String(childId).replace('child-', '')) - 1
+        const step = script[Math.min(i, script.length - 1)]
+        return {
+          whenIdle: async () => {
+            if (step && step.throw !== undefined) throw new Error(step.throw)
+          },
+          session: { snapshotEvents: () => (step && step.text !== undefined ? said(step.text) : []) },
+        }
+      },
+    }
+    return { subagents, agents, started, drained, prompts, count: () => n }
+  }
+
+  /** continuable 経路で 1 回走らせる。 */
+  const runMode = async (script, config = {}, args = {}, jobs) => {
+    const farm = makeChildFarm(script)
+    const opts = { subagents: farm.subagents, agents: farm.agents }
+    if (jobs !== undefined) opts.jobs = jobs
+    const stub = stubContext({ report: 'r' }, opts)
+    mod.apply(stub.ctx, { researchMode: 'continuable', ...config })
+    const out = await stubDefsExecute(stub, {
+      topic: 'テスト主題',
+      depth: 1,
+      questions: '1. 質問1は何か。',
+      synthesize: false,
+      review: false,
+      ...args,
+    }, stubExec(stub.ctx))
+    return { out, farm }
+  }
+
+  // (a) 質問 1 件: 子 1 体 → 破棄 1 回。報告に研究結果が入る。
+  {
+    const { out, farm } = await runMode([{ text: evidence(['事実A']) }])
+    assert.strictEqual(out.ok, true, '研究は成功する')
+    assert.ok(out.report.includes('質問1は何か'), '研究した子問題が報告に入る')
+    assert.ok(out.report.includes('事実A'), 'confirmed の claim が報告に入る')
+    assert.strictEqual(farm.count(), 1, '質問 1 件につき子 1 体')
+    assert.deepStrictEqual(farm.drained, ['child-1'], '作った子は必ず破棄する（常駐枠を漏らさない）')
+    assert.ok(farm.prompts[0].includes('只输出一个 JSON'), '子に JSON 出力を明示する（outputSchema が無いため）')
+    assert.ok(farm.prompts[0].includes('追加指示'), '子に「割り込みを受け付ける」と伝える')
+  }
+
+  // (b) 出力が不正なら作り直す。作り直しの子も破棄される。
+  {
+    const { out, farm } = await runMode(
+      [{ text: 'JSON ではありません' }, { text: evidence(['二度目の事実']) }],
+      { continuableRetries: 1 },
+    )
+    assert.strictEqual(out.ok, true)
+    assert.ok(out.report.includes('二度目の事実'), '再試行で得た結果を採用する')
+    assert.strictEqual(farm.count(), 2, '1 回作り直す（continuableRetries: 1）')
+    assert.deepStrictEqual(farm.drained, ['child-1', 'child-2'], '失敗した子も破棄する')
+  }
+
+  // (c) 再試行しない設定なら、失敗した子は失敗のまま（壊れた値を混ぜない）。
+  {
+    const { out, farm } = await runMode([{ text: 'JSON ではありません' }], { continuableRetries: 0 })
+    assert.strictEqual(out.ok, true, '研究自体は完走する')
+    assert.ok(out.report.includes('研究失败'), '失敗した子問題は失敗として明示される')
+    assert.strictEqual(farm.count(), 1, '再試行しない')
+    assert.deepStrictEqual(farm.drained, ['child-1'], '失敗しても破棄する')
+  }
+
+  // (d) 子が例外を投げても、破棄は必ず行われる（finally の検証）。
+  {
+    const { out, farm } = await runMode([{ throw: 'エンジンが落ちた' }], { continuableRetries: 0 })
+    assert.strictEqual(out.ok, true, '子の失敗で研究全体は落ちない')
+    assert.ok(out.report.includes('研究失败'), 'その子問題は失敗として記録される')
+    assert.deepStrictEqual(farm.drained, ['child-1'], '例外でも破棄する（枠を漏らさない）')
+  }
+
+  // (e) 高優先度ギャップが次ラウンドの補充研究になる（上限 maxFollowUps）。
+  {
+    const withGaps = JSON.stringify({
+      confirmed: [{ claim: 'G', source: 's', confidence: 'high' }],
+      uncertain: [],
+      gaps: [
+        { aspect: 'ギャップ甲', priority: 'high' },
+        { aspect: 'ギャップ乙', priority: 'high' },
+        { aspect: 'ギャップ丙', priority: 'low' },
+      ],
+    })
+    const { out, farm } = await runMode([{ text: withGaps }], { maxFollowUps: 1 })
+    assert.strictEqual(out.ok, true)
+    // depth 1 → ループは depth+1 = 2 ラウンドまで。1ラウンド目=質問1、2ラウンド目=補充1（上限1）。
+    assert.strictEqual(farm.count(), 2, '補充研究は maxFollowUps で抑えられる（low は対象外）')
+    assert.ok(farm.prompts[1].includes('ギャップ甲'), '高優先度ギャップが補充研究になる')
+    assert.ok(!farm.prompts[1].includes('ギャップ丙'), 'low 優先度は補充研究にしない')
+    assert.strictEqual(farm.drained.length, 2, '補充研究の子も破棄する')
+  }
+
+  // (f) 十分な maxQuestions のもとで、1ラウンドは全質問を消化する（補充に回さない）。
+  {
+    const many = ['1. 質問A。', '2. 質問B。'].join('\n')
+    const { out, farm } = await runMode([{ text: evidence(['事実X']) }], { maxQuestions: 8, maxFollowUps: 2 }, { questions: many })
+    assert.strictEqual(out.ok, true)
+    assert.strictEqual(farm.count(), 2, '2 件の質問に子 2 体（補充は発生しない）')
+    assert.ok(out.report.includes('質問A') && out.report.includes('質問B'), '両方とも報告に入る')
+  }
+
+  // (g) 進捗はジョブへ直接流れる（workflow/* イベントに依存しない）。
+  {
+    const { jobs, started } = stubJobs()
+    const { out } = await runMode([{ text: evidence(['事実J']) }], {}, {}, jobs)
+    assert.strictEqual(out.ok, true)
+    assert.strictEqual(out.jobId, 'job-1', 'jobId を返す')
+    assert.strictEqual(started.length, 1, 'ジョブを 1 つ作る')
+    const handle = started[0].handle
+    assert.ok(handle.appends.some((a) => a.text.includes('== 规划 ==')), '計画フェーズが見出しで出る')
+    assert.ok(handle.appends.some((a) => a.text.includes('== 研究·第1轮 ==')), '研究フェーズが見出しで出る')
+    assert.ok(handle.appends.some((a) => a.text.includes('開始')), '研究者の開始が出る')
+    assert.ok(handle.appends.some((a) => a.text.includes('completed')), '研究者の終了が出る')
+    const settled = await started[0].settled
+    assert.strictEqual(settled.status, 'completed', 'ジョブは completed で決着する')
+  }
+
+  // (h) 方針は config で切り替わる。既定は現行の workflow のまま（安全側）。
+  {
+    const stub = stubContext({ report: 'r' }, { subagents: makeChildFarm([{ text: 'x' }]).subagents, agents: makeChildFarm([{ text: 'x' }]).agents })
+    mod.apply(stub.ctx, {})
+    await stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q' }, stubExec(stub.ctx))
+    assert.strictEqual(stub.requests.length, 1, '既定は workflow エンジンを使う（挙動を変えない）')
+  }
+})
