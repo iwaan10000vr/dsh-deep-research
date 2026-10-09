@@ -927,6 +927,7 @@ function registerPocTool(ctx: Context): void {
       prompt: { type: 'string', description: '子に投げるプロンプト' },
       hold: { type: 'boolean', description: 'true なら完了を待たずに childId だけ返す' },
       drain: { type: 'boolean', description: 'true なら各子を完了後に破棄してスロットを解放する' },
+      dump: { type: 'boolean', description: 'true なら assistant/* イベントの payload 構造を出力する（診断用）' },
     },
     output: {
       schema: {
@@ -996,8 +997,33 @@ function registerPocTool(ctx: Context): void {
         try {
           const events = agent.session.snapshotEvents()
           const read = pocLastAssistantText(events)
-          log.push('#' + (i + 1) + ' events=' + events.length + ' types=[' + [...new Set(read.kinds)].slice(0, 8).join(',') + ']')
+          // 型は切り詰めない（どれが出ているかが診断の生命線）。
+          log.push('#' + (i + 1) + ' events=' + events.length + ' types=[' + [...new Set(read.kinds)].join(',') + ']')
           log.push('#' + (i + 1) + ' output(' + read.text.length + ')=' + read.text.slice(0, 70).replace(/\n/g, ' '))
+          if (args.dump === true) {
+            // 診断用: assistant/* の payload 構造をそのまま出す。出力抽出の契約
+            // （data.message.content か data.content か）を実物で確定させるため。
+            for (const raw of events) {
+              const event = raw as { type?: unknown; data?: unknown; seq?: unknown }
+              const type = String(event?.type ?? '')
+              if (!type.startsWith('assistant/')) continue
+              const data = event.data as Record<string, unknown> | undefined
+              const keys = data === undefined ? '(no data)' : Object.keys(data).join(',')
+              log.push('  DUMP seq=' + String(event.seq) + ' ' + type + ' data.keys=[' + keys + ']')
+              for (const k of ['message', 'content', 'stream']) {
+                const v = data?.[k]
+                if (v === undefined) continue
+                const shape = Array.isArray(v)
+                  ? 'array(' + v.length + ')'
+                  : (typeof v === 'object' && v !== null
+                    ? 'object(' + Object.keys(v as object).join('|') + ')'
+                    : typeof v)
+                log.push('    .' + k + ' = ' + shape)
+              }
+              const preview = JSON.stringify(data).slice(0, 300)
+              log.push('    raw=' + preview)
+            }
+          }
         } catch (error) {
           log.push('#' + (i + 1) + ' output FAILED: ' + pocDescribe(error))
         }
