@@ -276,12 +276,29 @@ dsh plugin --profile <profile> remove @dsh-external/dsh-deep-research
 | **実行中の指示** | **不可**（子は one-shot） | **可能**（子が常駐し `next-step` で届く） |
 | 子の質問 | 不可 | **可能**（`send_message` で親に聞ける） |
 | 構造化出力 | `outputSchema` で強制 | JSON を回収して検証（失敗は作り直し） |
-| 実績 | 安定・長時間の実測あり | 新規（テストで担保） |
+| 実績 | 安定・長時間の実測あり | 実機検証済み（下記） |
 
 **`'workflow'` が既定なのは安全側の選択です。** 実測で分かっている事実として、
 エンジンが作る研究者は **one-shot で steer できません**（子のプロンプトに親への
 `send_message` 指示が無く、`next-step` への挿入も起きない）。実行中に注文を付けたい
 ときだけ `'continuable'` を選んでください。
+
+### `'continuable'` の実機検証（2026-10-09）
+
+フェーズ0（PoC）と実機の研究で、次を確認しました。
+
+| 項目 | 実測 |
+| --- | --- |
+| `startContinuable` → `whenIdle` で完了が取れる | **OK**（+1.4〜5.2 秒。待機中に events が 7→24 に増えた＝開始前に活動が登録される） |
+| 常駐枠の解放（`drainContinuableChildren`） | **OK — 9 体連続で成功**（上限 8 を突破） |
+| 子の最終出力の抽出 | **OK**（`output(6)=POC-OK`） |
+| **実行中の子への Steer** | **OK** — `agent/inbox/spliced target=next-step` で届き、子が「追加指示を受け取りました」と応答して方針を変えた |
+| 研究者が continuable で作られる | **OK** — `origin=subagent depth=2` かつ `send_message` 指示あり（workflow 経路では無し＝steer 不可） |
+| 双方向質問 | **OK** — 子が「判断が必要な曖昧さが2点あります」と親へ質問し、**回答を待たずに完遂**（`whenIdle` が正常に返った） |
+| ジョブミラー（この経路でも進捗が見える） | **OK** — `== 规划 ==` `> 研究1·第1轮 開始  子 4e3edd8d-…` が job に流れた |
+
+**研究者に指示を送るには、進捗に出る `子 <childId>` を使います。** 実行中の研究者は
+UI のサブエージェント一覧にも出ます。
 
 `'continuable'` の性質:
 
