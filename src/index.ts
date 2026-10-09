@@ -493,15 +493,26 @@ return {
 
 // ── 観測面（ジョブミラー） ───────────────────────────────────────────────────
 //
-// deep_research は前景で走るため、メインエージェントは完走まで何も見えません。
-// DSH には「非 tool-workflow 実行」の正規の観測面があり、job の出力リングに
-// 進捗を流すとセッションヘッダのジョブ一覧がライブで表示します。ここでは
-// workflow/* イベントを購読して job に写します（tool-workflow の
-// createWorkflowRecordMirror と同じ形。あちらが唯一の正準実装）。
+// 実測で分かったこと（当初の理解は間違っていた）:
 //
-// 購読は apply() でプラグインごとに 1 回だけ張り、runId → job の対応で
-// 自分の実行のイベントだけを拾います（イベント payload は run の同一性を
-// 持つので、他の実行のものは info.id で弾かれる）。
+//   1. **主役はサブエージェント一覧。** `researchMode: 'continuable'` の研究者は
+//      常駐するので、UI のサブエージェント一覧に出て、開いて実行中に指示を送れる。
+//      「今どこまで進んだか」「何を調べているか」はここで見る。
+//   2. **ジョブは owner でスコープされる。**
+//      `registry.list(owner).filter(job => job.owner === owner && ...)`
+//      なので、別セッションのジョブは `job_list` に出ない。
+//   3. **前景実行の間、呼び出し元はジョブを触れない。** ターンがブロックされて
+//      いるため `job_list` を呼ぶ機会がない。だから `run_in_background: true` を
+//      用意した（背景は `exec.signal` を橋渡ししない = ターン終了で殺されない）。
+//
+// ではミラーは何の役に立つのか: **後から読める記録**。実行が完了すれば job の
+// 通知が届き、`job_output` でフェーズの流れと childId を辿れる。実測で
+// 「== 研究·第1轮 == > 研究1·第1轮 開始 子 4e3edd8d-…」が取れている。
+// ライブの観測と介入は 1 のサブエージェント一覧が担う。
+//
+// workflow/* の購読は tool-workflow の createWorkflowRecordMirror と同じ形
+// （あちらが唯一の正準実装）。購読は apply() でプラグインごとに 1 回だけ張り、
+// runId → job の対応で自分の実行のイベントだけを拾う。
 
 /** `ctx.jobs` の、このプラグインが使う範囲だけを写した型（TS 依存を避ける）。 */
 interface JobHandleLike {
@@ -639,23 +650,49 @@ export function apply(ctx: Context, config: Config = {}) {
         type: 'boolean',
         description: '是否让审阅子代理做对抗性审查（默认 false）：引用纠错、覆盖度审计、矛盾与过度自信标注，并给出需要补充研究的最高优先级缺口。',
       },
+      run_in_background: {
+        type: 'boolean',
+        description: '在后台运行（默认 false）：立即返回 job id，不等研究完成。研究在后台继续，'
+          + '进度用 job_output、完成后用 job_list 读取。**适合你（主代理）要当编排者时**——'
+          + '先派发研究，然后立刻回到对话里响应用户；用户还能在研究者常驻期间直接给它追加指示。'
+          + '注意：后台运行不会随你的回合结束而中止（这正是它和前台的区别）。',
+      },
     },
     output: {
       schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          ok: { type: 'boolean', required: true },
-          report: { type: 'string', required: true },
-          review: { type: 'string' },
-          jobId: { type: 'string' },
-        },
+        // 前景（既定）は研究結果を、背景は job の情報を返す。tool-workflow の
+        // 出力スキーマが同じ形（kind で弁別する oneOf）を使っている。
+        oneOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', required: true, const: 'foreground' },
+              ok: { type: 'boolean', required: true },
+              report: { type: 'string', required: true },
+              review: { type: 'string' },
+              jobId: { type: 'string' },
+            },
+          },
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', required: true, const: 'background' },
+              jobId: { type: 'string', required: true },
+            },
+          },
+        ],
       },
       render: (_args, value) => [{
         type: 'text',
-        text: value.ok
-          ? (value.review !== undefined ? `${value.report}\n\n${value.review}` : value.report)
-          : `deep_research 未能完成研究：${value.report}`,
+        text: value.kind === 'background'
+          ? `deep_research 已在后台开始（job ${value.jobId}）。`
+            + '进度用 job_output 读取，完成通知会带着结果到达。'
+            + '研究者常驻期间，用户可以直接给它追加指示。'
+          : (value.ok
+            ? (value.review !== undefined ? `${value.report}\n\n${value.review}` : value.report)
+            : `deep_research 未能完成研究：${value.report}`),
       }],
     },
     async execute(args, exec) {
@@ -677,46 +714,12 @@ export function apply(ctx: Context, config: Config = {}) {
         throw new Error('deep_research requires an Agent preset with workflowEngine: mount this plugin inside the preset\'s `delegation` group (or another group sharing its `isolate: workflowEngine` realm), not on the host root')
       }
 
-      // 観測面: ジョブを 1 つ作り、進捗をそこへ流す。ジョブが無い構成では
-      // ミラーせず従来どおり動く（try/catch で握りつぶす）。ジョブは中止の
-      // 入口にもなる: job_kill → cancel() → controller.abort → run が cancelled。
-      const jobs = (parent.ctx.get('jobs') ?? ctx.get('jobs')) as JobsServiceLike | undefined
-      const controller = new AbortController()
-      let jobId: string | undefined
-      let job: JobHandleLike | undefined
-      let settleJob: ((outcome: JobOutcomeLike) => void) | undefined
-      const jobSettled = new Promise<JobOutcomeLike>((resolve) => { settleJob = resolve })
-
+      // ── 引数の検証を、ジョブを作る前に済ませる ──
+      //
+      // 順序が大事。ジョブを作ってから throw すると、ジョブの `done` が解決されず
+      // 決着しないまま残る（一覧に「実行中」の幽霊が出る）。
       const topic = String(args.topic).trim()
       if (topic.length === 0) throw new Error('deep_research: topic must not be empty')
-
-      // ジョブはトピック確定後に作る（label に使うため）。
-      if (jobs !== undefined && typeof parent.id === 'string' && parent.id.length > 0) {
-        try {
-          jobId = jobs.start({
-            kind: 'deep-research',
-            label: 'deep_research: ' + topic.slice(0, 60),
-            owner: String(parent.id),
-            outputLimitBytes: 1 << 20,
-            run: (handle) => {
-              job = handle
-              handle.updateProgress('開始')
-              return {
-                cancel: (reason) => { controller.abort(reason ?? 'deep_research cancelled') },
-                done: jobSettled,
-              }
-            },
-          })
-        } catch (error) {
-          // 観測できないだけで研究は続行する。ただし理由は残す（静かに殺すと
-          // 「なぜ進捗が見えないのか」が分からなくなる）。
-          jobId = undefined
-          job = undefined
-          const logger = (ctx as unknown as { logger?: { warn?: (m: string) => void } }).logger
-          logger?.warn?.('deep_research: job mirror unavailable (' + String(error) + '); research continues without progress reporting')
-        }
-      }
-
       const purpose = typeof args.purpose === 'string' && args.purpose.trim().length > 0
         ? args.purpose.trim()
         : undefined
@@ -744,36 +747,40 @@ export function apply(ctx: Context, config: Config = {}) {
         ? 1
         : Math.max(0, Math.floor(config.continuableRetries))
 
-      // どの経路でもジョブを決着させる（常駐したままのジョブを残さない）。
-      const finishJob = (outcome: JobOutcomeLike): void => {
-        if (job === undefined) return
-        job.updateProgress(outcome.status === 'completed'
-          ? '完了'
-          : '終了: ' + String(outcome.detail ?? outcome.status))
-        if (settleJob !== undefined) settleJob(outcome)
-      }
+      const jobs = (parent.ctx.get('jobs') ?? ctx.get('jobs')) as JobsServiceLike | undefined
+      const label = 'deep_research: ' + topic.slice(0, 60)
 
-      // ── continuable 経路（実行中に人間が研究者へ注文できる） ──
-      //
-      // エンジンを使わないので、`workflow/*` イベントは来ない。進捗は jobProgress で
-      // 直接ジョブへ書く。signal は job_kill と exec.signal の両方に反応させる。
-      if (researchMode === 'continuable') {
-        const subagents = (parent.ctx.get('subagents') ?? ctx.get('subagents')) as SubagentsForChildrenLike | undefined
-        const agents = (parent.ctx.get('agents') ?? ctx.get('agents')) as AgentsLookupLike | undefined
-        if (subagents === undefined || agents === undefined) {
-          finishJob({ status: 'failed', detail: 'no subagents/agents service' })
-          throw new Error('deep_research: researchMode "continuable" requires the `subagents` and `agents` services')
-        }
-        const progress = job === undefined ? silentProgress() : jobProgress(job)
-        progress.log('研究を開始（continuable: 実行中に UI から研究者へ指示できます）')
-        try {
+      /**
+       * 研究本体。前景・背景の両方から呼ぶ。
+       *
+       * `handle` を渡すと進捗がそこへ流れる（無ければ何も出さない）。`signal` は
+       * **呼び出し側が組み立てて渡す**: 前景では `exec.signal` と job_kill 用の
+       * controller を合成し、背景では controller だけにする。背景で `exec.signal`
+       * を混ぜると、ターンが終わった瞬間に研究が殺される（それが前景との違い）。
+       *
+       * 引数の検証は呼び出し側で済んでいる前提（ここでは throw しない）。
+       */
+      const runResearch = async (
+        handle: JobHandleLike | undefined,
+        signal: AbortSignal,
+      ): Promise<{ report: string; review?: string }> => {
+        const progress = handle === undefined ? silentProgress() : jobProgress(handle)
+
+        // ── continuable 経路（実行中に人間が研究者へ注文できる） ──
+        // エンジンを使わないので `workflow/*` イベントは来ない。進捗は jobProgress で
+        // 直接ジョブへ書く。
+        if (researchMode === 'continuable') {
+          const subagents = (parent.ctx.get('subagents') ?? ctx.get('subagents')) as SubagentsForChildrenLike | undefined
+          const agents = (parent.ctx.get('agents') ?? ctx.get('agents')) as AgentsLookupLike | undefined
+          if (subagents === undefined || agents === undefined) {
+            throw new Error('deep_research: researchMode "continuable" requires the `subagents` and `agents` services')
+          }
+          progress.log('研究を開始（continuable: 実行中に UI から研究者へ指示できます）')
           const out = await runContinuableResearch({
             subagents,
             agents,
             parent,
-            signal: exec.signal instanceof AbortSignal
-              ? AbortSignal.any([exec.signal, controller.signal])
-              : controller.signal,
+            signal,
             provider: subagentProvider ?? 'spawn',
             progress,
             retries: continuableRetries,
@@ -790,100 +797,183 @@ export function apply(ctx: Context, config: Config = {}) {
             researcherRounds,
             ...(Object.keys(models).length > 0 ? { models } : {}),
           })
-          finishJob({ status: 'completed', result: '研究が完了しました（詳細はツール結果を参照）' })
-          return {
-            ok: true,
-            report: out.report,
-            ...(out.review !== undefined ? { review: out.review } : {}),
-            ...(jobId !== undefined ? { jobId } : {}),
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          finishJob({ status: 'failed', detail: message })
-          throw error
+          return { report: out.report, ...(out.review !== undefined ? { review: out.review } : {}) }
+        }
+
+        // ── workflow 経路（既定） ──
+        const run = workflowEngine.start({
+          script: SCRIPT,
+          meta: {
+            name: 'deep-research',
+            description: 'Adaptive deep research: answer-space definition, dimension coverage, EIG-driven research rounds, rate-distortion synthesis, optional error-correcting review.',
+            whenToUse: 'Deep research / investigation tasks needing multi-source evidence and a cited report.',
+            phases: [
+              { title: '规划', detail: 'Answer-space definition + dimension coverage decomposition' },
+              { title: '研究', detail: 'Adaptive research rounds over built-in web tools' },
+              // The engine matches phase() calls by exact title (workflow/types.ts); the
+              // script calls '研究·第N轮' with N up to depth+1 (depth contract: 1-3).
+              { title: '研究·第1轮', detail: 'Adaptive research round over built-in web tools' },
+              { title: '研究·第2轮', detail: 'Adaptive research round over built-in web tools' },
+              { title: '研究·第3轮', detail: 'Adaptive research round over built-in web tools' },
+              { title: '研究·第4轮', detail: 'Adaptive research round over built-in web tools' },
+              { title: '综合', detail: 'Rate-distortion report synthesis' },
+              { title: '审查', detail: 'Opt-in error-correcting adversarial review' },
+            ],
+          } satisfies WorkflowMeta,
+          args: {
+            topic,
+            ...(purpose !== undefined ? { purpose } : {}),
+            ...(questions.length > 0 ? { questions } : {}),
+            depth,
+            synthesize,
+            review,
+            maxParallel,
+            maxQuestions,
+            maxFollowUps,
+            researcherRounds,
+            ...(questionsDropped > 0 ? { questionsDropped } : {}),
+            ...(Object.keys(models).length > 0 ? { models } : {}),
+          },
+          ...(subagentProvider !== undefined ? { subagentProvider } : {}),
+          ...(maxTotalAgents !== undefined ? { maxTotalAgents } : {}),
+          parent,
+          signal,
+        })
+
+        // run.id は start() の戻りで確定し、phase などのイベントはこの後に来る。
+        // ここで対応づければ、自分の実行のイベントだけがジョブに入る。
+        if (handle !== undefined) {
+          runJobs.set(String(run.id), handle)
+          handle.updateProgress('研究を開始')
+        }
+
+        const result = await run.result
+        if (handle !== undefined) runJobs.delete(String(run.id))
+        await run.dispose()
+
+        // `run.result` は reject しない（失敗は stopReason 'error'/'cancelled' として
+        // 解決する）ので、ここで初めて失敗が分かる。
+        if (result.stopReason !== 'completed') {
+          throw new Error(`deep_research: workflow run ${result.stopReason}${result.error !== undefined ? ` (${result.error})` : ''}`)
+        }
+        const raw: unknown = result.value
+        if (raw === null || typeof raw !== 'object') {
+          throw new Error('deep_research: workflow returned no report')
+        }
+        const record = raw as Record<string, unknown>
+        if (typeof record.report !== 'string') {
+          throw new Error('deep_research: workflow returned no report')
+        }
+        return {
+          report: record.report,
+          ...(typeof record.review === 'string' ? { review: record.review } : {}),
         }
       }
 
-      const run = workflowEngine.start({
-        script: SCRIPT,
-        meta: {
-          name: 'deep-research',
-          description: 'Adaptive deep research: answer-space definition, dimension coverage, EIG-driven research rounds, rate-distortion synthesis, optional error-correcting review.',
-          whenToUse: 'Deep research / investigation tasks needing multi-source evidence and a cited report.',
-          phases: [
-            { title: '规划', detail: 'Answer-space definition + dimension coverage decomposition' },
-            { title: '研究', detail: 'Adaptive research rounds over built-in web tools' },
-            // The engine matches phase() calls by exact title (workflow/types.ts); the
-            // script calls '研究·第N轮' with N up to depth+1 (depth contract: 1-3).
-            { title: '研究·第1轮', detail: 'Adaptive research round over built-in web tools' },
-            { title: '研究·第2轮', detail: 'Adaptive research round over built-in web tools' },
-            { title: '研究·第3轮', detail: 'Adaptive research round over built-in web tools' },
-            { title: '研究·第4轮', detail: 'Adaptive research round over built-in web tools' },
-            { title: '综合', detail: 'Rate-distortion report synthesis' },
-            { title: '审查', detail: 'Opt-in error-correcting adversarial review' },
-          ],
-        } satisfies WorkflowMeta,
-        args: {
-          topic,
-          ...(purpose !== undefined ? { purpose } : {}),
-          ...(questions.length > 0 ? { questions } : {}),
-          depth,
-          synthesize,
-          review,
-          maxParallel,
-          maxQuestions,
-          maxFollowUps,
-          researcherRounds,
-          ...(questionsDropped > 0 ? { questionsDropped } : {}),
-          ...(Object.keys(models).length > 0 ? { models } : {}),
-        },
-        ...(subagentProvider !== undefined ? { subagentProvider } : {}),
-        ...(maxTotalAgents !== undefined ? { maxTotalAgents } : {}),
-        parent,
-        // job_kill も exec.signal（親のキャンセル）も、同じ run を止められるようにする。
-        // exec.signal が本物の AbortSignal でない場合は controller 側だけを使う
-        // （AbortSignal.any は AbortSignal 以外を受け取ると TypeError になる）。
-        signal: job === undefined
-          ? exec.signal
-          : (exec.signal instanceof AbortSignal
-            ? AbortSignal.any([exec.signal, controller.signal])
-            : controller.signal),
-      })
-
-      // run.id は start() の戻りで確定し、phase などのイベントはこの後に来る。
-      // ここで対応づければ、自分の実行のイベントだけがジョブに入る。
-      if (job !== undefined) {
-        runJobs.set(String(run.id), job)
-        job.updateProgress('研究を開始')
+      // ── 背景実行: 呼び出し元を塞がない ──
+      //
+      // これが「メインをオーケストレーターにする」ための機構。背景では
+      // `exec.signal` を橋渡ししないので、ターンが終わっても研究が生き残る
+      // （tool-workflow の startBackgroundRun と同じ扱い。あちらも signal を
+      // 渡さないことで、前景との違いを作っている）。呼び出し元は即座に jobId を
+      // 受け取り、会話に戻る。中止は job_kill（＝下の controller）。
+      if (args.run_in_background === true) {
+        if (jobs === undefined) {
+          throw new Error('deep_research: run_in_background requires the `jobs` service')
+        }
+        const jobId = jobs.start({
+          kind: 'deep-research',
+          label,
+          owner: String(parent.id),
+          outputLimitBytes: 1 << 20,
+          run: (handle) => {
+            const controller = new AbortController()
+            handle.updateProgress('開始')
+            const done = (async (): Promise<JobOutcomeLike> => {
+              try {
+                await runResearch(handle, controller.signal)
+                handle.updateProgress('完了')
+                return { status: 'completed', result: '研究が完了しました（レポートは job_output で読めます）' }
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error)
+                handle.updateProgress('終了: ' + message)
+                return { status: 'failed', detail: message }
+              }
+            })()
+            return {
+              cancel: (reason) => { controller.abort(reason ?? 'deep_research cancelled') },
+              done,
+            }
+          },
+        })
+        return { kind: 'background' as const, jobId }
       }
 
-      const result = await run.result
-      runJobs.delete(String(run.id))
-      await run.dispose()
+      // ── 前景実行（既定） ──
+      const controller = new AbortController()
+      let job: JobHandleLike | undefined
+      let settleJob: ((outcome: JobOutcomeLike) => void) | undefined
+      const jobSettled = new Promise<JobOutcomeLike>((resolve) => { settleJob = resolve })
+      let jobId: string | undefined
 
-      // `run.result` は reject しない（失敗は stopReason 'error'/'cancelled' として
-      // 解決する）ので、throw しうるのは以下の検証だけ。どの経路でもジョブを
-      // 決着させて、常駐したままのジョブを残さない。
-      if (result.stopReason !== 'completed') {
-        finishJob({ status: 'failed', detail: String(result.stopReason) })
-        throw new Error(`deep_research: workflow run ${result.stopReason}${result.error !== undefined ? ` (${result.error})` : ''}`)
+      if (jobs !== undefined && typeof parent.id === 'string' && parent.id.length > 0) {
+        try {
+          jobId = jobs.start({
+            kind: 'deep-research',
+            label,
+            owner: String(parent.id),
+            outputLimitBytes: 1 << 20,
+            run: (handle) => {
+              job = handle
+              handle.updateProgress('開始')
+              return {
+                cancel: (reason) => { controller.abort(reason ?? 'deep_research cancelled') },
+                done: jobSettled,
+              }
+            },
+          })
+        } catch (error) {
+          // 観測できないだけで研究は続行する。ただし理由は残す（静かに殺すと
+          // 「なぜ進捗が見えないのか」が分からなくなる）。
+          jobId = undefined
+          job = undefined
+          const logger = (ctx as unknown as { logger?: { warn?: (m: string) => void } }).logger
+          logger?.warn?.('deep_research: job mirror unavailable (' + String(error) + '); research continues without progress reporting')
+        }
       }
-      const raw: unknown = result.value
-      if (raw === null || typeof raw !== 'object') {
-        finishJob({ status: 'failed', detail: 'workflow returned no report' })
-        throw new Error('deep_research: workflow returned no report')
+
+      // ジョブを必ず決着させる（常駐したままのジョブを残さない）。
+      const finishJob = (outcome: JobOutcomeLike): void => {
+        if (job === undefined) return
+        job.updateProgress(outcome.status === 'completed'
+          ? '完了'
+          : '終了: ' + String(outcome.detail ?? outcome.status))
+        if (settleJob !== undefined) settleJob(outcome)
       }
-      const record = raw as Record<string, unknown>
-      if (typeof record.report !== 'string') {
-        finishJob({ status: 'failed', detail: 'workflow returned no report' })
-        throw new Error('deep_research: workflow returned no report')
-      }
-      finishJob({ status: 'completed', result: '研究が完了しました（詳細はツール結果を参照）' })
-      return {
-        ok: true,
-        report: record.report,
-        ...(typeof record.review === 'string' ? { review: record.review } : {}),
-        ...(jobId !== undefined ? { jobId } : {}),
+
+      // job_kill も exec.signal（呼び出し元のキャンセル）も、同じ研究を止められる
+      // ようにする。exec.signal が本物の AbortSignal でない場合は controller 側だけを
+      // 使う（AbortSignal.any は AbortSignal 以外を受け取ると TypeError になる）。
+      const signal = job === undefined
+        ? exec.signal
+        : (exec.signal instanceof AbortSignal
+          ? AbortSignal.any([exec.signal, controller.signal])
+          : controller.signal)
+
+      try {
+        const out = await runResearch(job, signal)
+        finishJob({ status: 'completed', result: '研究が完了しました（詳細はツール結果を参照）' })
+        return {
+          kind: 'foreground' as const,
+          ok: true,
+          report: out.report,
+          ...(out.review !== undefined ? { review: out.review } : {}),
+          ...(jobId !== undefined ? { jobId } : {}),
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        finishJob({ status: 'failed', detail: message })
+        throw error
       }
     },
   }))

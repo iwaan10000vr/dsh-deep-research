@@ -413,6 +413,15 @@ function isSchemaRecord(value) {
 function compileValueSchema(input, path) {
   if (!isSchemaRecord(input)) throw new Error(`unsupported schema: ${path} must be a value schema object`)
   const node = {}
+  // oneOf: 出力が「前景の結果」か「背景の job 情報」のどちらかになるツールで使う
+  // （tool-workflow の出力スキーマが同じ形をしている）。
+  if (Object.hasOwn(input, 'oneOf')) {
+    if (!Array.isArray(input.oneOf) || input.oneOf.length === 0) {
+      throw new Error(`unsupported schema: ${path}.oneOf must be a non-empty array`)
+    }
+    node.oneOf = input.oneOf.map((branch, i) => compileValueSchema(branch, `${path}.oneOf[${i}]`))
+    return node
+  }
   switch (input.type) {
     case 'object': {
       node.type = 'object'
@@ -436,6 +445,8 @@ function compileValueSchema(input, path) {
     case 'null': {
       node.type = input.type
       if (Object.hasOwn(input, 'enum')) node.enum = input.enum
+      // const: 「kind: 'background'」のような固定値の弁別子に使う。
+      if (Object.hasOwn(input, 'const')) node.const = input.const
       break
     }
     default:
@@ -487,9 +498,18 @@ function checkSchemaNode(node, path, violations) {
     return
   }
   for (const key of Object.keys(node)) {
-    if (['type', 'properties', 'required', 'additionalProperties', 'items', 'enum'].includes(key)) continue
+    if (['type', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'oneOf', 'const'].includes(key)) continue
     if (SCHEMA_ANNOTATIONS.includes(key)) continue
     violations.push(`${path}.${key} is not a supported keyword`)
+  }
+  // oneOf: 各分岐を検証する（type は持たない）。
+  if (Object.hasOwn(node, 'oneOf')) {
+    if (!Array.isArray(node.oneOf) || node.oneOf.length === 0) {
+      violations.push(`${path}.oneOf must be a non-empty array`)
+      return
+    }
+    node.oneOf.forEach((branch, i) => checkSchemaNode(branch, `${path}.oneOf[${i}]`, violations))
+    return
   }
   const type = node.type
   if (typeof type !== 'string' || !SCHEMA_TYPES.includes(type)) {
@@ -520,6 +540,18 @@ function validateJsonSchemaValue(schema, value, path = 'value') {
 }
 
 function checkValue(node, value, path, violations) {
+  // oneOf: どれか 1 つの分岐に通ればよい（type を持たない）。
+  if (Array.isArray(node.oneOf)) {
+    const attempts = node.oneOf.map((branch) => {
+      const local = []
+      checkValue(branch, value, path, local)
+      return local
+    })
+    if (!attempts.some((errors) => errors.length === 0)) {
+      violations.push(`"${path}" matches no oneOf branch`)
+    }
+    return
+  }
   switch (node.type) {
     case 'object': {
       if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -535,6 +567,15 @@ function checkValue(node, value, path, violations) {
       for (const [key, child] of Object.entries(properties)) {
         if (!Object.hasOwn(value, key) || value[key] === undefined) continue
         checkValue(child, value[key], `${path}.${key}`, violations)
+      }
+      // additionalProperties: false は「宣言していないキーを拒否する」契約。
+      // 出力スキーマの弁別（kind ごとに許されるキーが違う）を効かせるために要る。
+      if (node.additionalProperties === false) {
+        for (const key of Object.keys(value)) {
+          if (!Object.hasOwn(properties, key)) {
+            violations.push(`"${path}.${key}" is not allowed`)
+          }
+        }
       }
       break
     }
@@ -555,6 +596,9 @@ function checkValue(node, value, path, violations) {
       }
       if (node.enum !== undefined && !node.enum.includes(value)) {
         violations.push(`"${path}" must be one of ${JSON.stringify(node.enum)}`)
+      }
+      if (node.const !== undefined && value !== node.const) {
+        violations.push(`"${path}" must be ${JSON.stringify(node.const)}`)
       }
     }
   }
@@ -678,9 +722,33 @@ test('④ 工具注册与输出 schema 编译通过', async () => {
   assert.deepEqual(plain(mod.inject), ['tools'], 'inject 只声明 tools（引擎经 Agent 作用域解析）')
   assert.doesNotThrow(() => assertSupportedJsonSchema(def.output.schema), 'output.schema 应在引擎受支持子集内')
   assert.doesNotThrow(() => assertSupportedJsonSchema(def.parameters), 'parameters 应编译为受支持的对象 schema')
-  const valid = { ok: true, report: '# r', review: '审阅' }
-  assert.deepEqual(validateJsonSchemaValue(def.output.schema, valid), [], '合法输出通过')
-  assert.ok(validateJsonSchemaValue(def.output.schema, { ok: true }).length > 0, '缺 report 被拒')
+
+  // 出力は oneOf（前景の結果 / 背景の job 情報）。kind で弁別する。
+  const foreground = { kind: 'foreground', ok: true, report: '# r', review: '审阅' }
+  assert.deepEqual(validateJsonSchemaValue(def.output.schema, foreground), [], '前景の出力が通る')
+  const background = { kind: 'background', jobId: 'deep-research-1' }
+  assert.deepEqual(validateJsonSchemaValue(def.output.schema, background), [], '背景の出力が通る')
+
+  assert.ok(
+    validateJsonSchemaValue(def.output.schema, { kind: 'foreground', ok: true }).length > 0,
+    '前景で report が無ければ拒否',
+  )
+  assert.ok(
+    validateJsonSchemaValue(def.output.schema, { kind: 'background' }).length > 0,
+    '背景で jobId が無ければ拒否',
+  )
+  assert.ok(
+    validateJsonSchemaValue(def.output.schema, { ok: true, report: 'r' }).length > 0,
+    'kind が無ければどの分岐にも合わない',
+  )
+  assert.ok(
+    validateJsonSchemaValue(def.output.schema, { kind: 'background', jobId: 'j', report: 'r' }).length > 0,
+    '背景で余分なキーは拒否',
+  )
+
+  // run_in_background がモデルに見えていること（これが「オーケストレーター」の入口）。
+  assert.ok(def.parameters.properties.run_in_background !== undefined, 'run_in_background がパラメータにある')
+  assert.strictEqual(def.parameters.properties.run_in_background.type, 'boolean', '真偽値である')
 })
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1736,5 +1804,202 @@ test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直�
     mod.apply(stub.ctx, {})
     await stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q' }, stubExec(stub.ctx))
     assert.strictEqual(stub.requests.length, 1, '既定は workflow エンジンを使う（挙動を変えない）')
+  }
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑰ run_in_background：呼び出し元を塞がない（メインをオーケストレーターにする）
+//
+// 前景実行は `exec.signal` を研究へ橋渡しするので、呼び出し元のターンが終わると
+// 研究が殺される（tool-workflow が前景で `onAbort` を張っているのと同じ事情）。
+// 背景実行はその橋渡しを**しない**ので、ターンが終わっても研究が生き残る。
+// これが「メインが先に研究を派して、自分は会話に戻る」を成立させる。
+//
+// ここで固定するのは:
+//   1. 即座に jobId を返し、研究の完了を待たない（= 呼び出し元が塞がらない）
+//   2. preview の signal が `exec.signal` に連動**しない**（ターン終了で死なない）
+//   3. キャンセルは job の cancel()（= job_kill）で効く
+//   4. 研究の失敗は job を failed で決着させる（放置しない）
+//   5. jobs が無ければ背景は選べない（黙って前景に落とさない）
+// ════════════════════════════════════════════════════════════════════════════
+test('⑰ run_in_background：即座に返し、ターン終了で死なず、job_kill で止まる', async () => {
+  const { mod } = await loadPlugin()
+
+  /** 子の最終出力（研究者スキーマに合う JSON）。 */
+  const said = (text) => ([{
+    type: 'assistant/message',
+    seq: 1,
+    data: { message: { content: [{ type: 'text', text }] } },
+  }])
+  const evidence = JSON.stringify({
+    confirmed: [{ claim: 'C', source: 'https://example.com', confidence: 'high' }],
+    uncertain: [],
+    gaps: [],
+  })
+
+  /**
+   * 完了を保留できる子の偽物。`hold` を解決するまで whenIdle が返らないので、
+   * 「背景がまだ走っている」状態を作れる。
+   */
+  const makeFarm = () => {
+    let pendingResolve = null
+    const prompts = []
+    const subagents = {
+      startContinuable: async (spec) => {
+        prompts.push(spec.request.prompt[0].text)
+        // 完了を保留する。テストが resolveHold() を呼ぶまで返らない。
+        return { childId: 'child-' + prompts.length }
+      },
+      drainContinuableChildren: async () => {},
+    }
+    const hold = new Promise((resolve) => { pendingResolve = resolve })
+    const agents = {
+      get: (childId) => ({
+        whenIdle: async () => { await hold },
+        session: { snapshotEvents: () => said(evidence) },
+      }),
+    }
+    return { subagents, agents, prompts, resolveHold: () => pendingResolve() }
+  }
+
+  // (a) 背景は即座に jobId を返し、研究の完了を待たない。
+  {
+    const farm = makeFarm()
+    const { jobs, started } = stubJobs()
+    const stub = stubContext({ report: 'r' }, { jobs, subagents: farm.subagents, agents: farm.agents })
+    mod.apply(stub.ctx, { researchMode: 'continuable' })
+
+    const exec = stubExec(stub.ctx)
+    const out = await stubDefsExecute(stub, {
+      topic: 'テスト', depth: 1, questions: '1. Q', run_in_background: true,
+    }, exec)
+
+    assert.strictEqual(out.kind, 'background', '背景として返る')
+    assert.strictEqual(out.jobId, 'job-1', 'jobId を返す')
+    assert.strictEqual('report' in out, false, '研究結果はまだ無い（完了を待っていない）')
+    assert.strictEqual(started.length, 1, 'ジョブが 1 つ作られる')
+    assert.strictEqual(started[0].settled !== undefined, true, 'ジョブの決着を観測できる')
+
+    // まだ決着していないこと（＝呼び出し元を塞いでいない）。
+    let settledEarly = false
+    started[0].settled.then(() => { settledEarly = true })
+    await new Promise((r) => setTimeout(r, 10))
+    assert.strictEqual(settledEarly, false, '研究が終わるまでジョブは決着しない')
+
+    // 保留を解くとジョブが completed で決着する。
+    farm.resolveHold()
+    const settled = await started[0].settled
+    assert.strictEqual(settled.status, 'completed', '研究完了でジョブが完了する')
+    assert.ok(started[0].handle.progress.includes('完了'), '完了が進捗に出る')
+  }
+
+  // (b) 背景では exec.signal を研究に橋渡ししない（ターン終了で殺されない）。
+  {
+    const farm = makeFarm()
+    const { jobs, started } = stubJobs()
+    const stub = stubContext({ report: 'r' }, { jobs, subagents: farm.subagents, agents: farm.agents })
+    mod.apply(stub.ctx, { researchMode: 'continuable' })
+
+    // 呼び出し元のターンが終わった（= exec.signal が abort した）状況を作る。
+    const abort = new AbortController()
+    const exec = stubExec(stub.ctx, abort.signal)
+    await stubDefsExecute(stub, {
+      topic: 'テスト', depth: 1, questions: '1. Q', run_in_background: true,
+    }, exec)
+
+    abort.abort('ターン終了')
+
+    // 中断後も研究が完了できること（前景なら signal 経由で殺される）。
+    farm.resolveHold()
+    const settled = await started[0].settled
+    assert.strictEqual(settled.status, 'completed', '呼び出し元のターン終了では死なない')
+  }
+
+  // (c) job_kill 相当（hooks.cancel）で研究を止められる。
+  {
+    const farm = makeFarm()
+    const { jobs, started } = stubJobs()
+    const stub = stubContext({ report: 'r' }, { jobs, subagents: farm.subagents, agents: farm.agents })
+    mod.apply(stub.ctx, { researchMode: 'continuable' })
+
+    await stubDefsExecute(stub, {
+      topic: 'テスト', depth: 1, questions: '1. Q', run_in_background: true,
+    }, stubExec(stub.ctx))
+
+    assert.strictEqual(typeof started[0].hooks.cancel, 'function', 'cancel が提供される')
+    // cancel → controller.abort → 子の signal が中断される（例外にならないこと）。
+    assert.doesNotThrow(() => started[0].hooks.cancel('やめて'))
+  }
+
+  // (d) 研究そのものが失敗したらジョブを failed で決着させる（放置しない）。
+  //
+  // 注意: 「子が失敗した」は研究全体の失敗ではない。continuable 経路の子が
+  // 落ちても、その子問題を失敗として報告に残し、研究は完走する（失敗の隔離）。
+  // ここで試すのは**研究本体が throw する**場合。
+  {
+    const { jobs, started } = stubJobs()
+    // workflow 経路で、エンジンが error で終わる状況を作る。
+    const stub = stubContext({ report: 'r' }, { deferResult: true, jobs })
+    mod.apply(stub.ctx, {})
+
+    const out = await stubDefsExecute(stub, {
+      topic: 'テスト', depth: 1, questions: '1. Q', run_in_background: true,
+    }, stubExec(stub.ctx))
+    assert.strictEqual(out.kind, 'background')
+
+    stub.engineControl.resolve(undefined, 'error')
+
+    const settled = await started[0].settled
+    assert.strictEqual(settled.status, 'failed', '研究の失敗は failed で決着する')
+    assert.ok(String(settled.detail).includes('error'), '理由が残る')
+    assert.ok(
+      started[0].handle.progress.some((p) => p.includes('終了')),
+      '失敗が進捗にも出る',
+    )
+  }
+
+  // (e) jobs が無い構成で背景を要求したら、黙って前景に落とさずエラーにする。
+  {
+    const farm = makeFarm()
+    const stub = stubContext({ report: 'r' }, { subagents: farm.subagents, agents: farm.agents })
+    mod.apply(stub.ctx, { researchMode: 'continuable' })
+    await assert.rejects(
+      stubDefsExecute(stub, {
+        topic: 'テスト', depth: 1, questions: '1. Q', run_in_background: true,
+      }, stubExec(stub.ctx)),
+      /run_in_background requires the `jobs` service/,
+      '背景が使えないことは黙殺しない',
+    )
+  }
+
+  // (f) 既定（run_in_background なし）は前景のまま。既存の挙動を変えない。
+  {
+    const farm = makeFarm()
+    const { jobs } = stubJobs()
+    const stub = stubContext({ report: 'r' }, { jobs, subagents: farm.subagents, agents: farm.agents })
+    mod.apply(stub.ctx, { researchMode: 'continuable' })
+    const exec = stubExec(stub.ctx)
+    // synthesize:false で三態証拠をそのまま返させる（合成を挟むと、fake の子が
+    // 同じ出力を返すため合成結果も同じ文字列になり、証拠の検証にならない）。
+    const pending = stubDefsExecute(stub, {
+      topic: 'テスト', depth: 1, questions: '1. Q', synthesize: false,
+    }, exec)
+    farm.resolveHold()
+    const out = await pending
+    assert.strictEqual(out.kind, 'foreground', '既定は前景')
+    assert.strictEqual(out.ok, true, '研究結果をそのまま返す')
+    assert.ok(out.report.includes('已确认事实'), '三態証拠のレンダリングが入っている')
+  }
+
+  // (g) 引数不正は、ジョブを作る前に弾く（決着しない幽霊ジョブを残さない）。
+  {
+    const { jobs, started } = stubJobs()
+    const stub = stubContext({ report: 'r' }, { jobs })
+    mod.apply(stub.ctx, {})
+    await assert.rejects(
+      stubDefsExecute(stub, { topic: 'T', depth: 9, run_in_background: true }, stubExec(stub.ctx)),
+      /depth must be 1, 2 or 3/,
+    )
+    assert.strictEqual(started.length, 0, '検証に落ちたらジョブを作らない')
   }
 })
