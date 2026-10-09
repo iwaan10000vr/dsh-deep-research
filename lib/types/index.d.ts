@@ -34,12 +34,12 @@
  *   gaps = conditional entropy made explicit) and stops internally the moment
  *   one round adds nothing.
  *
- * ── 综合 (rate–distortion) ─────────────────────────────────────────────────
+ * ── Integration / synthesis (rate–distortion) ──────────────────────────────
  *   The final report is lossy compression for a stated decision: it keeps only
  *   information that distinguishes conclusions, and PRESERVES uncertainty
- *   (confidence / 矛盾 / verified blind spots) instead of masking it.
+ *   (confidence / contradictions / verified blind spots) instead of masking it.
  *
- * ── 审查 (channel redundancy / error correction, opt-in) ───────────────────
+ * ── Review (channel redundancy / error correction, opt-in) ─────────────────
  *   An adversarial reviewer acts as a parity check: citation spot-checks
  *   (hallucinated sources = channel noise), coverage audit against the declared
  *   dimensions, contradiction and over-confidence marking.

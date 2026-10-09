@@ -154,9 +154,9 @@ async function runScript(body, args, roles = {}) {
     const label = opts.label ?? ''
     state.prompts.push({ label, prompt, opts })
     const role = label.startsWith('研究') ? 'researcher'
-      : label === '规划' ? 'planner'
-        : label === '综合' ? 'synthesizer'
-          : label === '审查' ? 'reviewer'
+      : label === '計画' ? 'planner'
+        : label === '統合' ? 'synthesizer'
+          : label === '審査' ? 'reviewer'
             : null
     if (!role) throw new Error('unexpected agent label: ' + label)
     // 構造化が必要なのは研究者と計画（三態の証拠 / 計画 JSON を検証するため）。
@@ -222,8 +222,8 @@ test('① 已给 questions：跳过规划，单轮研究收敛', async () => {
     researcher: [mk([{ claim: 'C1', source: 'https://example.com', confidence: 'high' }])],
   })
   assert.strictEqual(prompts.length, 1, '只应有一次研究调用（无规划/综合/审查）')
-  assert.strictEqual(prompts[0].label, '研究1·第1轮')
-  assert.strictEqual(prompts[0].opts.phase, '研究·第1轮')
+  assert.strictEqual(prompts[0].label, '研究1・第1ラウンド')
+  assert.strictEqual(prompts[0].opts.phase, '研究・第1ラウンド')
   assert.deepEqual(plain(prompts[0].opts.schema), plain(RESEARCHER_SCHEMA), '研究调用带 RESEARCHER_SCHEMA')
   assert.strictEqual(result.rounds, 1)
   assert.strictEqual(result.subquestions, 1)
@@ -232,7 +232,7 @@ test('① 已给 questions：跳过规划，单轮研究收敛', async () => {
   assert.strictEqual(result.review, null)
   assert.ok(result.report.includes('## Q1'), '报告应含子问题标题')
   assert.ok(result.report.includes('C1'), '报告应含已确认事实')
-  assert.ok(result.report.includes('子问题 1 个，完成 1 个，研究轮次 1 轮'), '报告应含证据状态统计')
+  assert.ok(result.report.includes('子問題 1 件、完了 1 件、調査ラウンド 1 回'), '報告に証拠の状態の統計が入る')
 })
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -264,8 +264,8 @@ test('⑩ 証拠を同梱しない：synthesize:true は本文＋所在案内の
     assert.ok(result.report.includes(synthText), 'レポート本文が入っている')
     assert.ok(!result.report.includes(longClaim), '生証拠（claim 本文）は同梱されない')
     assert.ok(!result.report.includes('## 附录'), '旧「附录：原始证据状态」の節は無くなった')
-    assert.ok(result.report.includes('证据状态：子问题 1 个，完成 1 个'), '件数の案内は残る')
-    assert.ok(result.report.includes('研究子代理的会话'), '証拠の所在を案内する')
+    assert.ok(result.report.includes('証拠の状態：子問題 1 件、完了 1 件'), '件数の案内は残る')
+    assert.ok(result.report.includes('研究子エージェントのセッション'), '証拠の所在を案内する')
   }
 
   // (b) synthesize:false → 証拠そのものが成果物なので従来どおり返す。
@@ -285,7 +285,7 @@ test('⑩ 証拠を同梱しない：synthesize:true は本文＋所在案内の
     })
     assert.ok(result.report.includes(longClaim), 'synthesize:false では証拠を返す')
     assert.ok(result.report.includes('## Q1'), '証拠状態の節構成')
-    assert.ok(!result.report.includes('证据状态：'), 'synthesize:false に所在案内は付けない')
+    assert.ok(!result.report.includes('証拠の状態：'), 'synthesize:false に所在案内は付けない')
   }
 })
 
@@ -312,8 +312,8 @@ test('② high-priority 缺口自动进入第 2 轮，直到边际增益为零',
   assert.ok(result.report.includes('## G1'), '补充研究的问题应入报告')
   assert.ok(result.report.includes('G1 已确认'), '第2轮证据应入报告')
   assert.strictEqual(prompts.length, 2)
-  assert.strictEqual(prompts[1].label, '研究1·第2轮', '第2轮是补充研究（follow-up 提示词）')
-  assert.ok(prompts[1].prompt.includes('补充研究'), '第2轮提示词应标注补充研究')
+  assert.strictEqual(prompts[1].label, '研究1・第2ラウンド', '第2轮是补充研究（follow-up 提示词）')
+  assert.ok(prompts[1].prompt.includes('follow-up research'), '第2ラウンドのプロンプトが追加調査だと分かる')
 })
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -338,15 +338,15 @@ test('③ 无 questions：规划 → 盲区侦察进入第 2 轮', async () => {
       mk([{ claim: '盲区X 确实无公开信息', source: '', confidence: 'low' }]),
     ],
   })
-  assert.strictEqual(prompts[0].label, '规划', '先规划')
+  assert.strictEqual(prompts[0].label, '計画', '先规划')
   assert.deepEqual(plain(prompts[0].opts.schema), plain(PLANNER_SCHEMA), '规划调用带 PLANNER_SCHEMA')
   // 盲区侦察与规划问题同轮并行（subs.concat 在循环前），不额外消耗轮次
   assert.strictEqual(result.rounds, 1, '盲区侦察并入第1轮')
   assert.strictEqual(result.subquestions, 2, '规划问题 + 盲区侦察都在报告里')
-  assert.ok(result.report.includes('研究答案空间：支撑决策 D'), '报告应含规划答案空间')
+  assert.ok(result.report.includes('調査の答えの空間：支撑决策 D'), '報告に計画の答えの空間が入る')
   assert.ok(result.report.includes('盲区X'), '盲区侦察结果应入报告')
-  const blindPrompt = prompts.find((p) => p.label === '研究2·第1轮')
-  assert.ok(blindPrompt && blindPrompt.prompt.includes('盲区假设'), '侦察调用提示词应标注盲区假设')
+  const blindPrompt = prompts.find((p) => p.label === '研究2・第1ラウンド')
+  assert.ok(blindPrompt && blindPrompt.prompt.includes('blind-spot hypothesis'), '侦察调用提示词应标注盲区假设')
 })
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -870,8 +870,8 @@ test('⑥ 全队列在单轮内消化：maxParallel 只限并发，不再把问�
   }
   assert.strictEqual(prompts.length, 6)
   assert.deepEqual(prompts.map((p) => p.label), [
-    '研究1·第1轮', '研究2·第1轮', '研究3·第1轮',
-    '研究4·第1轮', '研究5·第1轮', '研究6·第1轮',
+    '研究1・第1ラウンド', '研究2・第1ラウンド', '研究3・第1ラウンド',
+    '研究4・第1ラウンド', '研究5・第1ラウンド', '研究6・第1ラウンド',
   ], '同一轮内按序编号，轮次不递增')
 })
 
@@ -981,7 +981,7 @@ test('⑨ 長さノブ：質問数・補充研究・研究者ラウンドの上�
       })],
       researcher,
     })
-    assert.strictEqual(prompts[0].label, '规划', '先に計画')
+    assert.strictEqual(prompts[0].label, '計画', '先に計画')
     assert.strictEqual(
       prompts.length - 1,
       8,
@@ -1059,7 +1059,7 @@ test('⑨ 長さノブ：質問数・補充研究・研究者ラウンドの上�
       researcher: [mkRes(1, [])],
     })
     assert.ok(
-      prompts[0].prompt.includes('最多 1 轮搜索'),
+      prompts[0].prompt.includes('at most 1 rounds'),
       'depth=1 は研究者の探索を 1 ラウンドに制限する（prompt に反映）',
     )
   }
@@ -1080,7 +1080,7 @@ test('⑨ 長さノブ：質問数・補充研究・研究者ラウンドの上�
       researcher: [mkRes(1, [])],
     })
     assert.ok(
-      prompts[0].prompt.includes('最多 3 轮搜索'),
+      prompts[0].prompt.includes('at most 3 rounds'),
       'researcherRounds=3 が研究者プロンプトに反映される',
     )
   }
@@ -1186,8 +1186,8 @@ test('⑫ ジョブミラー：進捗を写し、中止でき、必ず決着す�
 
     // run の起動直後（run.id 確定後）にイベントが来る、という実機の順序を再現する。
     await Promise.resolve()
-    stub.emitWorkflow('workflow/phase', { id: 'run-1' }, '研究·第1轮')
-    stub.emitWorkflow('workflow/agent-start', { id: 'run-1' }, { seq: 1, label: '研究1·第1轮', phase: '研究·第1轮' })
+    stub.emitWorkflow('workflow/phase', { id: 'run-1' }, '研究・第1ラウンド')
+    stub.emitWorkflow('workflow/agent-start', { id: 'run-1' }, { seq: 1, label: '研究1・第1ラウンド', phase: '研究・第1ラウンド' })
     stub.emitWorkflow('workflow/agent-end', { id: 'run-1' }, { seq: 1, outcome: 'completed' })
 
     assert.strictEqual(started.length, 1, 'ジョブが 1 つ作られる')
@@ -1198,9 +1198,9 @@ test('⑫ ジョブミラー：進捗を写し、中止でき、必ず決着す�
     assert.ok(spec.outputLimitBytes > 0, '出力リングを有界にする')
 
     const handle = started[0].handle
-    assert.ok(handle.progress.includes('研究·第1轮'), 'phase が updateProgress に写る')
-    assert.ok(handle.appends.some((a) => a.text.includes('== 研究·第1轮 ==')), 'phase 見出しが append される')
-    assert.ok(handle.appends.some((a) => a.text.includes('研究1·第1轮') && a.text.includes('開始')), 'agent-start が append される')
+    assert.ok(handle.progress.includes('研究・第1ラウンド'), 'phase が updateProgress に写る')
+    assert.ok(handle.appends.some((a) => a.text.includes('== 研究・第1ラウンド ==')), 'phase 見出しが append される')
+    assert.ok(handle.appends.some((a) => a.text.includes('研究1・第1ラウンド') && a.text.includes('開始')), 'agent-start が append される')
     assert.ok(handle.appends.some((a) => a.text.includes('#1') && a.text.includes('completed')), 'agent-end が append される')
 
     // 完了でジョブが 'completed' に決着し、jobId が戻る。
@@ -1706,11 +1706,11 @@ test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直�
     assert.ok(out.report.includes('事実A'), 'confirmed の claim が報告に入る')
     assert.strictEqual(farm.count(), 1, '質問 1 件につき子 1 体')
     assert.deepStrictEqual(farm.drained, ['child-1'], '作った子は必ず破棄する（常駐枠を漏らさない）')
-    assert.ok(farm.prompts[0].includes('只输出一个 JSON'), '子に JSON 出力を明示する（outputSchema が無いため）')
-    assert.ok(farm.prompts[0].includes('追加指示'), '子に「割り込みを受け付ける」と伝える')
+    assert.ok(farm.prompts[0].includes('output exactly one JSON object'), '子に JSON 出力を明示する（outputSchema が無いため）')
+    assert.ok(farm.prompts[0].includes('additional instructions'), '子に「割り込みを受け付ける」と伝える')
     assert.ok(farm.prompts[0].includes('send_message'), '子に双方向の質問手段を伝える')
     assert.ok(
-      farm.prompts[0].includes('不要为了等待回答而空转'),
+      farm.prompts[0].includes('Do not idle waiting for an answer'),
       '「回答待ちで空転するな」と明示する（whenIdle が永久に返らない事故を防ぐ）',
     )
   }
@@ -1731,7 +1731,7 @@ test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直�
   {
     const { out, farm } = await runMode([{ text: 'JSON ではありません' }], { continuableRetries: 0 })
     assert.strictEqual(out.ok, true, '研究自体は完走する')
-    assert.ok(out.report.includes('研究失败'), '失敗した子問題は失敗として明示される')
+    assert.ok(out.report.includes('調査は失敗した'), '失敗した子問題は失敗として明示される')
     assert.strictEqual(farm.count(), 1, '再試行しない')
     assert.deepStrictEqual(farm.drained, ['child-1'], '失敗しても破棄する')
   }
@@ -1740,7 +1740,7 @@ test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直�
   {
     const { out, farm } = await runMode([{ throw: 'エンジンが落ちた' }], { continuableRetries: 0 })
     assert.strictEqual(out.ok, true, '子の失敗で研究全体は落ちない')
-    assert.ok(out.report.includes('研究失败'), 'その子問題は失敗として記録される')
+    assert.ok(out.report.includes('調査は失敗した'), 'その子問題は失敗として記録される')
     assert.deepStrictEqual(farm.drained, ['child-1'], '例外でも破棄する（枠を漏らさない）')
   }
 
@@ -1781,8 +1781,8 @@ test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直�
     assert.strictEqual(out.jobId, 'job-1', 'jobId を返す')
     assert.strictEqual(started.length, 1, 'ジョブを 1 つ作る')
     const handle = started[0].handle
-    assert.ok(handle.appends.some((a) => a.text.includes('== 规划 ==')), '計画フェーズが見出しで出る')
-    assert.ok(handle.appends.some((a) => a.text.includes('== 研究·第1轮 ==')), '研究フェーズが見出しで出る')
+    assert.ok(handle.appends.some((a) => a.text.includes('== 計画 ==')), '計画フェーズが見出しで出る')
+    assert.ok(handle.appends.some((a) => a.text.includes('== 研究・第1ラウンド ==')), '研究フェーズが見出しで出る')
     assert.ok(handle.appends.some((a) => a.text.includes('開始')), '研究者の開始が出る')
     assert.ok(handle.appends.some((a) => a.text.includes('completed')), '研究者の終了が出る')
     // 実行中の研究者に人間が指示を送るには対象の特定が要る。
@@ -1988,7 +1988,7 @@ test('⑰ run_in_background：即座に返し、ターン終了で死なず、jo
     const out = await pending
     assert.strictEqual(out.kind, 'foreground', '既定は前景')
     assert.strictEqual(out.ok, true, '研究結果をそのまま返す')
-    assert.ok(out.report.includes('已确认事实'), '三態証拠のレンダリングが入っている')
+    assert.ok(out.report.includes('確認できた事実'), '三態証拠のレンダリングが入っている')
   }
 
   // (g) 引数不正は、ジョブを作る前に弾く（決着しない幽霊ジョブを残さない）。
