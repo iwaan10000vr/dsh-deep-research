@@ -1640,6 +1640,11 @@ test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直�
     assert.deepStrictEqual(farm.drained, ['child-1'], '作った子は必ず破棄する（常駐枠を漏らさない）')
     assert.ok(farm.prompts[0].includes('只输出一个 JSON'), '子に JSON 出力を明示する（outputSchema が無いため）')
     assert.ok(farm.prompts[0].includes('追加指示'), '子に「割り込みを受け付ける」と伝える')
+    assert.ok(farm.prompts[0].includes('send_message'), '子に双方向の質問手段を伝える')
+    assert.ok(
+      farm.prompts[0].includes('不要为了等待回答而空转'),
+      '「回答待ちで空転するな」と明示する（whenIdle が永久に返らない事故を防ぐ）',
+    )
   }
 
   // (b) 出力が不正なら作り直す。作り直しの子も破棄される。
