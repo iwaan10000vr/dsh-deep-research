@@ -873,8 +873,12 @@ function textOfContentBlocks(content: unknown): string {
  *   1. 最後の非空 `assistant/message` の本文
  *   2. それが無ければ `assistant/message` / `assistant/attempt` の stream を連結
  *   3. どちらも無ければ空文字
+ *
+ * continuable な子は `outputSchema` を持てない（ContinuableStartSpec が
+ * 構造的に除外している）ため、子の出力の解釈はこちら側の責任になる。
+ * 単体で検証できるよう export している（cordis の plugin 契約は name/inject/apply）。
  */
-function extractFinalAssistantText(events: readonly unknown[]): string {
+export function extractFinalAssistantText(events: readonly unknown[]): string {
   let message = ''
   const partial: string[] = []
   for (const raw of events) {

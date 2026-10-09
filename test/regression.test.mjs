@@ -1327,3 +1327,94 @@ test('⑬ 子の最終出力の抽出：message.content を読み、stream に�
     assert.strictEqual(fake.started.length, 2, '常駐上限（8）まで作れる')
   }
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑭ 実ログから採取した payload での出力抽出（実機の証拠に基づく回帰）
+//
+// 実機の PoC（childId 104f76a3）が output(0) を返したのは、抽出の修正が
+// DSH の起動（13:12:44）より後にコミットされた（13:14:19）ためで、修正版は
+// 動いていなかった。ここでは**その子のセッションログ（zstd）を展開して採取した
+// 生の payload** をそのまま使い、修正版が正しく "POC-OK" を返すことを示す。
+//
+// 採取元: .dsh/sessions/.../104f76a3-.../session.v4.jsonl.zstd
+//   seq 16: reasoning と tool-call だけ（text ブロック無し）→ 採用しない
+//   seq 21: text "POC-OK" → これを最終出力として選ぶ
+// ════════════════════════════════════════════════════════════════════════════
+test('⑭ 実ログの payload：text の無い assistant を飛ばして最後の本文を選ぶ', async () => {
+  const { mod } = await loadPlugin()
+
+  /** 実際のイベント列（子セッションから採取した形のまま）。 */
+  const realEvents = [
+    { type: 'system/message', seq: 8, data: { message: { role: 'system', content: [{ type: 'text', text: 'persona' }] } } },
+    { type: 'step/start', seq: 10, data: { turn: 1, step: 1 } },
+    {
+      type: 'assistant/message',
+      seq: 16,
+      data: {
+        turn: 1,
+        step: 1,
+        // 1回目の assistant は reasoning と tool-call だけ（text ブロックが無い）
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: 'The user just wants me to reply exactly "POC-OK"…' },
+            { type: 'tool-call', id: 'call_00_…', name: 'send_message', arguments: '{"agent_id":"…","message":"POC-OK"}' },
+          ],
+          source: { kind: 'model', provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' },
+          id: '9b4386f3-…',
+        },
+        usage: { inputTokens: 7143, outputTokens: 152, cacheReadTokens: 7424 },
+      },
+    },
+    { type: 'tool/call', seq: 17, data: { callId: 'call_00_…', name: 'send_message' } },
+    { type: 'tool/result', seq: 18, data: { callId: 'call_00_…', content: [{ type: 'text', text: 'accepted' }] } },
+    { type: 'step/start', seq: 20, data: { turn: 1, step: 2 } },
+    {
+      type: 'assistant/message',
+      seq: 21,
+      data: {
+        turn: 1,
+        step: 2,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'POC-OK' }],
+          source: { kind: 'model', provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' },
+          id: '32fe6c81-…',
+        },
+        usage: { inputTokens: 176, outputTokens: 5, cacheReadTokens: 17024 },
+        stream: [
+          { type: 'chunk', time: 1791519289387, chunk: { type: 'block-start', index: 0, blockType: 'text' } },
+          { type: 'text-chunks', time0: 1791519289387, index: 0, dt: [], texts: ['POC-OK'] },
+          { type: 'chunk', time: 1791519289388, chunk: { type: 'block-end', index: 0, block: { type: 'text', text: 'POC-OK' } } },
+        ],
+      },
+    },
+    { type: 'step/end', seq: 22, data: { turn: 1, step: 2 } },
+    { type: 'turn/end', seq: 23, data: { turn: 1 } },
+  ]
+
+  const fake = stubSubagents({ 'child-1': realEvents })
+  const stub = stubContext({ report: 'r' }, { subagents: fake.subagents, agents: fake.agents })
+  mod.apply(stub.ctx, { poc: true })
+  const poc = stub.defs.find((d) => d.name === 'poc_continuable')
+  const out = await poc.execute({ count: 1, prompt: 'Reply with exactly: POC-OK' }, stubExec(stub.ctx))
+
+  assert.strictEqual(out.ok, true)
+  assert.ok(
+    out.log.some((l) => l.includes('output(6)=POC-OK')),
+    '実ログの payload から "POC-OK"（6 文字）を取り出す。実際のログ: ' + JSON.stringify(out.log),
+  )
+  // text ブロックを持たない seq 16 を誤って採用していないこと。
+  assert.ok(
+    !out.log.some((l) => l.includes('The user just wants me')),
+    'reasoning ブロックは本文として採用しない',
+  )
+  assert.ok(
+    out.log.some((l) => l.includes('output FAILED') === false),
+    '例外なく抽出できる',
+  )
+
+  // 採取元と同じ構造（message.content）であることも直接確認する。
+  const direct = mod.extractFinalAssistantText(realEvents)
+  assert.strictEqual(direct, 'POC-OK', 'extractFinalAssistantText が実 payload から本文を選ぶ')
+})
