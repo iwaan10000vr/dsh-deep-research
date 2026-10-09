@@ -159,7 +159,11 @@ async function runScript(body, args, roles = {}) {
           : label === '审查' ? 'reviewer'
             : null
     if (!role) throw new Error('unexpected agent label: ' + label)
-    if (!opts.schema) throw new Error(`${label} 调用缺少 opts.schema（结构化 agent 契约）`)
+    // 構造化が必要なのは研究者と計画（三態の証拠 / 計画 JSON を検証するため）。
+    // 総合と審査は自由文の Markdown を返すので schema を持たない。
+    if ((role === 'researcher' || role === 'planner') && !opts.schema) {
+      throw new Error(`${label} 调用缺少 opts.schema（结构化 agent 契约）`)
+    }
     const value = take(role)
     return typeof value === 'function' ? value(prompt, opts) : value
   })
@@ -229,6 +233,60 @@ test('① 已给 questions：跳过规划，单轮研究收敛', async () => {
   assert.ok(result.report.includes('## Q1'), '报告应含子问题标题')
   assert.ok(result.report.includes('C1'), '报告应含已确认事实')
   assert.ok(result.report.includes('子问题 1 个，完成 1 个，研究轮次 1 轮'), '报告应含证据状态统计')
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑩ 証拠を同梱しない：synthesize:true のレポートは本文＋1行の所在案内だけ
+//    実測では生証拠の同梱が親のコンテキストを 12,491 トークン膨らませ、
+//    上限の 70% まで押し上げた（400 エラーの瀬戸際）。設計上、成果物は
+//    圧縮されたレポートであって証拠の山ではない。
+// ════════════════════════════════════════════════════════════════════════════
+test('⑩ 証拠を同梱しない：synthesize:true は本文＋所在案内のみ', async () => {
+  const longClaim = 'THIS-IS-THE-RAW-EVIDENCE-MARKER'
+  const synthText = 'FINAL-REPORT-BODY'
+
+  // (a) synthesize:true → 生証拠は入らない。件数と所在だけが残る。
+  {
+    const { result } = await runScript(SCRIPT, {
+      topic: 'T',
+      questions: [{ question: 'Q1', dimension: 'd' }],
+      depth: 1,
+      synthesize: true,
+      review: false,
+      maxParallel: 1,
+      maxQuestions: 8,
+      maxFollowUps: 2,
+      researcherRounds: 1,
+    }, {
+      researcher: [mk([{ claim: longClaim, source: 'https://example.com', confidence: 'high' }])],
+      synthesizer: [synthText],
+    })
+    assert.ok(result.report.includes(synthText), 'レポート本文が入っている')
+    assert.ok(!result.report.includes(longClaim), '生証拠（claim 本文）は同梱されない')
+    assert.ok(!result.report.includes('## 附录'), '旧「附录：原始证据状态」の節は無くなった')
+    assert.ok(result.report.includes('证据状态：子问题 1 个，完成 1 个'), '件数の案内は残る')
+    assert.ok(result.report.includes('研究子代理的会话'), '証拠の所在を案内する')
+  }
+
+  // (b) synthesize:false → 証拠そのものが成果物なので従来どおり返す。
+  {
+    const { result } = await runScript(SCRIPT, {
+      topic: 'T',
+      questions: [{ question: 'Q1', dimension: 'd' }],
+      depth: 1,
+      synthesize: false,
+      review: false,
+      maxParallel: 1,
+      maxQuestions: 8,
+      maxFollowUps: 2,
+      researcherRounds: 1,
+    }, {
+      researcher: [mk([{ claim: longClaim, source: 'https://example.com', confidence: 'high' }])],
+    })
+    assert.ok(result.report.includes(longClaim), 'synthesize:false では証拠を返す')
+    assert.ok(result.report.includes('## Q1'), '証拠状態の節構成')
+    assert.ok(!result.report.includes('证据状态：'), 'synthesize:false に所在案内は付けない')
+  }
 })
 
 // ════════════════════════════════════════════════════════════════════════════
