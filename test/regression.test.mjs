@@ -373,7 +373,7 @@ function evaluateModuleInVm() {
   src = stripTypeScriptTypes(src) // throws on non-erasable syntax — keeps the source portable
   src = src.replace("import { defineTool } from '@deepseek-ai/dsh-tools'", '')
   src = src.replaceAll(/\bexport\s+/g, '')
-  src += '\n;globalThis.__drExports = { name, inject, apply, SCRIPT, PLANNER_SCHEMA, RESEARCHER_SCHEMA }\n'
+  src += '\n;globalThis.__drExports = { name, inject, apply, SCRIPT, PLANNER_SCHEMA, RESEARCHER_SCHEMA, parseQuestionList, looksLikeInstruction }\n'
   const defs = []
   const context = vm.createContext({
     // 镜像 defineTool 的编译契约（dsh-tools schema.ts 子集）：
@@ -951,5 +951,85 @@ test('⑨ 長さノブ：質問数・補充研究・研究者ラウンドの上�
       prompts[0].prompt.includes('最多 3 轮搜索'),
       'researcherRounds=3 が研究者プロンプトに反映される',
     )
+  }
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑪ 呼び出し側 questions の衛生：指示文を質問にしない・上限を掛ける
+//    実測の逸脱: モデルが「方法制約」等の長いブロックを questions に渡し、
+//    その各行が研究質問になった（「【方法制約】web_search はAPIキー未設定で…」）。
+//    1 行 ≒ 7 分の直列時間なので、無駄が大きい。
+// ════════════════════════════════════════════════════════════════════════════
+test('⑪ 呼び出し側 questions：指示文を除外し、上限を掛ける', async () => {
+  const { mod } = await loadPlugin()
+
+  // 実測で観測した逸脱をそのまま再現する。指示文と質問が混ざったブロックを
+  // 渡したとき、研究者になるのは質問だけであるべき。
+  const blob = [
+    '【方法制約】web_search はAPIキー未設定で必ずエラーになる。呼び出さず、検索は web_fetch を使え。',
+    '【確定済みの圏内判定（これを疑うな）】碧南市 約6.6km圏内、高浜市街地 約9.36km圏内。',
+    '岡崎空襲（昭和20年7月19〜20日）の被害規模と軍事的理由は何か。',
+    '八丁味噌の醸造2社の明治〜昭和の産業史は何か。',
+    '距離は中心点からhaversineで計算せよ。',
+    'ja.wikipedia.org、各市公式サイトが有効。',
+  ].join('\n')
+
+  // (a) 指示文は研究対象にならない。質問 2 件だけが研究者に渡る。
+  {
+    const { ctx, defs, requests } = stubContext({ report: 'r' })
+    mod.apply(ctx, {})
+    await defs[0].execute({ topic: 'T', depth: 1, questions: blob }, stubExec(ctx))
+    const qs = requests[0].args.questions
+    assert.deepEqual(
+      plain(qs.map((q) => q.question)),
+      [
+        '岡崎空襲（昭和20年7月19〜20日）の被害規模と軍事的理由は何か。',
+        '八丁味噌の醸造2社の明治〜昭和の産業史は何か。',
+      ],
+      '指示文 4 行を除いた質問 2 件だけが研究対象になる',
+    )
+    assert.strictEqual(requests[0].args.questionsDropped, 4, '除外した行数をスクリプトに伝える')
+  }
+
+  // (b) 呼び出し側の questions にも上限が掛かる（旧実装は素通しだった）。
+  {
+    const many = Array.from({ length: 12 }, (_, i) => `質問${i + 1}は何か。`).join('\n')
+    const { ctx, defs, requests } = stubContext({ report: 'r' })
+    mod.apply(ctx, { maxQuestions: 3 })
+    await defs[0].execute({ topic: 'T', depth: 1, questions: many }, stubExec(ctx))
+    assert.strictEqual(requests[0].args.questions.length, 3, '呼び出し側の 12 件が 3 件に切られる')
+    assert.strictEqual(requests[0].args.questionsDropped, 9, '切った件数も伝える')
+  }
+
+  // (c) 逸脱が無ければ questionsDropped を書かない（無損 JSON を保つ）。
+  {
+    const { ctx, defs, requests } = stubContext({ report: 'r' })
+    mod.apply(ctx, { maxQuestions: 8 })
+    await defs[0].execute({ topic: 'T', depth: 1, questions: '1. Q1\n2. Q2' }, stubExec(ctx))
+    assert.ok(!('questionsDropped' in requests[0].args), '0 件のときは questionsDropped を書かない')
+    assert.strictEqual(requests[0].args.questions.length, 2, '普通の質問はそのまま通る')
+  }
+
+  // (d) スクリプト側でも、呼び出し側の質問に対する切り詰めを明示する。
+  {
+    const many = Array.from({ length: 6 }, (_, i) => ({ question: 'Q' + (i + 1), dimension: 'd' }))
+    const { result } = await runScript(SCRIPT, {
+      topic: 'T',
+      questions: many,
+      depth: 1,
+      synthesize: false,
+      review: false,
+      maxParallel: 1,
+      maxQuestions: 2,
+      maxFollowUps: 2,
+      researcherRounds: 1,
+    }, {
+      researcher: [
+        mk([{ claim: 'C1', source: 's1', confidence: 'high' }]),
+        mk([{ claim: 'C2', source: 's2', confidence: 'high' }]),
+      ],
+    })
+    assert.strictEqual(result.subquestions, 2, '研究されたのは 2 件だけ')
+    assert.ok(result.report.includes('絞った'), '切り詰めたことを planText に明示する')
   }
 })
