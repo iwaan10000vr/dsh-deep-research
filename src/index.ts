@@ -87,6 +87,34 @@ export interface Config {
    * at the back can hit the client's idle-stream timeout while they wait.
    */
   maxParallel?: number
+  /**
+   * 計画段階が出してよい子問題の上限（既定 8）。
+   *
+   * ローカルエンジンでは研究者の数がそのまま所要時間になる（直列なので1件≒7分）。
+   * 実測: 15 件で第1ラウンドだけで 105 分かかり、全体 195 分の 54% を占めた。
+   * 上限を下げると比例して短くなる。超えた分は捨てずに**切り詰め**（後述）、
+   * 重要度の高い次元が残るよう計画プロンプトで優先順位を明示している。
+   */
+  maxQuestions?: number
+  /**
+   * 1ラウンドが生む補充研究の上限（既定 2）。研究の広さのツマミ。
+   *
+   * 実測: 旧既定 4 では第2〜4ラウンドが毎回ぴったり 4 件になり、情報利得で
+   * 自然収束せずラウンド上限まで走り切った（合計 12 件 = 約 57 分）。
+   * 2 にすると補充は絞られ、上限に当たる前に収束しやすくなる。
+   */
+  maxFollowUps?: number
+  /**
+   * 各研究者が自分の中で回す探索ラウンドの上限（既定 2）。
+   * depth が 1 のときは 1。研究者1件あたりの所要（実測 平均 6.7 分）に効く。
+   */
+  researcherRounds?: number
+  /**
+   * 一時的な検証用: true で `poc_continuable` ツールを登録する。
+   * continuable な子のライフサイクル（完了検出・出力取得・スロット解放）を
+   * 実機で確かめるための使い捨て経路。検証が終わったらこのフラグごと削除する。
+   */
+  poc?: boolean
 }
 
 /** Planner structured output: answer space + dimension coverage + questions. */
@@ -177,18 +205,22 @@ const RESEARCHER_SCHEMA = {
  */
 const SCRIPT = String.raw`const PLANNER_SCHEMA = ${JSON.stringify(PLANNER_SCHEMA)}
 const RESEARCHER_SCHEMA = ${JSON.stringify(RESEARCHER_SCHEMA)}
-const { topic, questions, depth, synthesize, review, models, purpose, maxParallel } = args
+const { topic, questions, depth, synthesize, review, models, purpose, maxParallel,
+        maxQuestions, maxFollowUps, researcherRounds } = args
 const M = models ?? {}
-const LIMIT = depth >= 3 ? 4 : depth === 1 ? 2 : 3
+// 研究者が自分の中で回す探索ラウンド。depth 1 は浅く、それ以外は指定値。
+const LIMIT = depth === 1 ? 1 : (Number(researcherRounds) || 2)
 // concurrency = how many researchers run AT THE SAME TIME (1 = strictly serial).
 // It is deliberately separate from how many questions a round DRAINS: a local
 // engine serves one request at a time, so queueing four siblings does not make
 // them faster, it only makes the ones at the back wait (and idle-timeout).
 const concurrency = Math.max(1, Number(maxParallel) || 1)
-// maxFollowUps bounds how many high-priority gaps one round may turn into
-// follow-up questions. It is a research-breadth knob, not a concurrency one:
-// serializing the engine must not starve the adaptive re-planning loop.
-const maxFollowUps = Math.max(concurrency, 4)
+// 1ラウンドが生む補充研究の上限。研究の広さのツマミであって同時実行のツマミではない
+// （直列化しても適応的な再計画を殺さないため）。ローカルでは小さいほど早く終わる。
+const followUpCap = Math.max(1, Number(maxFollowUps) || 2)
+// 計画が出してよい子問題の上限。ローカルでは研究者の数＝所要時間なので、
+// ここが実行時間の最大のレバー。超過分は捨てず、次元の広い方から残す。
+const questionCap = Math.max(1, Number(maxQuestions) || 8)
 
 function confidenceLabel(c) {
   return c === 'high' ? '高' : c === 'medium' ? '中' : c === 'low' ? '低' : '中'
@@ -230,6 +262,8 @@ if (!subs) {
     + '1. 【答案空间】用一句话界定 scope：这份研究要回答什么问题、支撑什么判断或决策；若用途未说明，明确写出你假设的用途。\n'
     + '2. 【信息维度】枚举主题空间的信息维度（如：背景与现状、关键技术/机制、主要参与者与生态、数据与规模、趋势与未来、争议与风险、政策与监管、对比分析等，按主题取舍），这是后续覆盖度检查的基准。\n'
     + '3. 【多样性拆解】每个维度至少对应一个子问题（必要多样性定律：子问题集合的多样性必须覆盖主题空间的全部维度，否则必然存在盲区）；每个子问题给出：所属维度、搜索关键词线索（中英文）、验收标准 acceptance（怎样算回答了该子问题）。\n'
+    + '   **子问题总数上限：' + questionCap + ' 条**（这是运行环境的硬约束：本地推理引擎逐个研究，每条约 7 分钟）。'
+    + '因此请**按重要度排序**，把最能支撑答案空间的维度放在前面；超出上限的维度不要写成子问题，改列入 coverage_gaps。\n'
     + '4. 【覆盖度假设】列出 coverage_gaps：哪些维度你无法用子问题覆盖、或信息可能极难获取。这些会被后续研究轮实际验证——如果侦察发现信息其实可得，会自动补充研究；如果确实不可得，会作为已验证盲区写入报告。\n\n'
     + '只输出 JSON，不要输出任何其他文字。',
     {
@@ -248,9 +282,15 @@ if (!subs) {
   planText = '研究答案空间：' + (planned.scope || '（未声明）')
     + '\n覆盖维度：' + (dims.length > 0 ? dims.join('、') : '（未声明）')
     + (gaps.length > 0 ? '\n规划假设的盲区（待验证）：' + gaps.join('、') : '')
-  // 规划的盲区作为假设进入研究队列（超出 maxParallel 的部分留在队列里，
-  // 由后续轮次处理，绝不静默丢弃）。
-  subs = subs.concat(gaps.map((g) => ({ question: g, dimension: '盲区侦察', blind: true })))
+  // 盲区侦察も子問題として研究キューに入れる。ただし全体を questionCap で抑える:
+  // ローカルでは研究者1体 ≒ 7分の直列時間なので、ここが実行時間の最大のレバー。
+  // 溢れた分は捨てず、計画の順序（重要度順に作られている想定）を保って切り詰める。
+  const room = Math.max(1, questionCap - subs.length)
+  subs = subs.concat(gaps.slice(0, room).map((g) => ({ question: g, dimension: '盲区侦察', blind: true })))
+  if (subs.length > questionCap) {
+    planText += '\n（ローカル実行のため子問題を ' + questionCap + ' 件に絞った。元 ' + (subs.length) + ' 件）'
+    subs = subs.slice(0, questionCap)
+  }
 }
 
 phase('研究')
@@ -326,7 +366,7 @@ while (pending.length > 0 && round < depth + 1) {
     if (!f || !Array.isArray(f.gaps)) continue
     for (const g of f.gaps) {
       if (g.priority !== 'high') continue
-      if (seen.has(g.aspect) || leads.length >= maxFollowUps) continue
+      if (seen.has(g.aspect) || leads.length >= followUpCap) continue
       seen.add(g.aspect)
       leads.push({ question: g.aspect, followUp: true })
     }
@@ -365,7 +405,8 @@ if (synthesize) {
     + (purpose ? '\n研究用途（要支撑的决策/判断）：' + purpose : '')
     + (planText ? '\n' + planText : '')
     + '\n\n报告结构：\n## 摘要（3-5 句核心结论，含整体置信度评估）\n## 1. 背景\n## 2. 核心发现（按维度组织，每条附置信度与来源引用）\n## 3. 不确定性与矛盾（明确列出：哪些结论置信度低、哪些来源相互矛盾——不确定性本身就是重要信息，必须保留而非掩盖）\n## 4. 信息缺口与已验证盲区（规划假设的盲区经研究验证后的真实状态）\n## 5. 结论与建议（给出基于现有证据的最优判断，标注证据强度）\n## 6. 参考资料'
-    + '\n\n要求：所有关键信息行内引用来源 URL；区分事实（高置信）与推断（低置信）；矛盾信息要并列呈现；用表格/对比呈现适合的数据；避免泛泛而谈；中文输出，Markdown 格式；证据不足处明确说明，不要编造。\n\n以下是研究发现：\n\n' + intermediate,
+    + '\n\n要求：所有关键信息行内引用来源 URL；区分事实（高置信）与推断（低置信）；矛盾信息要并列呈现；用表格/对比呈现适合的数据；避免泛泛而谈；中文输出，Markdown 格式；证据不足处明确说明，不要编造。\n'
+    + '**长度约束（重要）**：这是"有损压缩"，不是资料汇编。目标 1,500〜3,000 字；每个论点 1〜3 句；能进表格的不要写成段落；引用只列 URL，不要复述来源内容；不要重复证据细节。宁可短而可判断，不要长而稀释。\n\n以下是研究发现：\n\n' + intermediate,
     {
       label: '综合',
       phase: '综合',
@@ -425,6 +466,19 @@ export function apply(ctx: Context, config: Config = {}) {
   const maxParallel = config.maxParallel === undefined
     ? 1
     : positiveInt(config.maxParallel, 1, 'maxParallel')
+  // Local-friendly run-length knobs. Every one of these trades breadth for wall
+  // clock; a local engine turns each researcher into ~7 minutes of serial time,
+  // so the question cap is the single biggest lever (15 -> 8 roughly halves the
+  // first round).
+  const maxQuestions = config.maxQuestions === undefined
+    ? 8
+    : positiveInt(config.maxQuestions, 8, 'maxQuestions')
+  const maxFollowUps = config.maxFollowUps === undefined
+    ? 2
+    : positiveInt(config.maxFollowUps, 2, 'maxFollowUps')
+  const researcherRounds = config.researcherRounds === undefined
+    ? 2
+    : positiveInt(config.researcherRounds, 2, 'researcherRounds')
 
   ctx.tools.register(defineTool({
     name: 'deep_research',
@@ -548,6 +602,9 @@ export function apply(ctx: Context, config: Config = {}) {
           synthesize,
           review,
           maxParallel,
+          maxQuestions,
+          maxFollowUps,
+          researcherRounds,
           ...(Object.keys(models).length > 0 ? { models } : {}),
         },
         ...(subagentProvider !== undefined ? { subagentProvider } : {}),
@@ -575,6 +632,136 @@ export function apply(ctx: Context, config: Config = {}) {
         report: record.report,
         ...(typeof record.review === 'string' ? { review: record.review } : {}),
       }
+    },
+  }))
+
+  if (config.poc === true) registerPocTool(ctx)
+}
+
+// ── 一時的な検証用（config.poc === true のときだけ登録） ─────────────────────
+//
+// deep_research を continuable な子で組み直す前に、実機で4点を確かめる:
+//   1. startContinuable → whenIdle で「1回の実行の完了」が取れるか
+//   2. 子の最終出力が取れるか（イベント名と本文の取り出し方）
+//   3. 子を多数作ってスロットが解放されるか（maxActiveSubagents の既定は 8）
+//   4. 返した childId の子に、UI から Steer が届くか（人間が操作して確認）
+//
+// 検証が終わったらこの節と Config.poc を削除する。
+
+/** 子のイベント列から、最後の assistant テキストを取り出す試作。 */
+function pocLastAssistantText(events: readonly unknown[]): { text: string; kinds: string[] } {
+  let text = ''
+  const kinds: string[] = []
+  for (const raw of events) {
+    const event = raw as { type?: unknown; data?: unknown }
+    if (typeof event?.type === 'string') kinds.push(event.type)
+    if (event?.type !== 'assistant/message') continue
+    const data = event.data as { content?: unknown } | undefined
+    if (!data || !Array.isArray(data.content)) continue
+    for (const block of data.content) {
+      const part = block as { type?: unknown; text?: unknown }
+      if (part?.type === 'text' && typeof part.text === 'string') text = part.text
+    }
+  }
+  return { text, kinds }
+}
+
+function pocDescribe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+interface PocAgentLike {
+  whenIdle(): Promise<void>
+  session: { snapshotEvents(offset?: unknown): readonly unknown[] }
+}
+
+function registerPocTool(ctx: Context): void {
+  ctx.tools.register(defineTool({
+    name: 'poc_continuable',
+    description:
+      '検証専用: continuable な子エージェントを count 体作り、完了検出・出力取得・'
+      + 'スロット解放を確かめる。返した childId の子は常駐するので、UI から Steer を試せる。'
+      + 'hold:true なら完了を待たずに childId だけ返す。',
+    parameters: {
+      count: { type: 'number', description: '作る子の数（8 を超える値でスロット解放を試す）' },
+      prompt: { type: 'string', description: '子に投げるプロンプト' },
+      hold: { type: 'boolean', description: 'true なら完了を待たずに childId だけ返す' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean', required: true },
+          log: { type: 'array', required: true, items: { type: 'string' } },
+          childIds: { type: 'array', required: true, items: { type: 'string' } },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.log.join('\n') + '\n\nchildIds:\n' + value.childIds.join('\n'),
+      }],
+    },
+    async execute(args, exec) {
+      const parent = exec.agent
+      if (!parent) throw new Error('poc_continuable: exec.agent is undefined')
+      const runtimeCtx = parent.ctx
+      const subagents = runtimeCtx.get('subagents') ?? ctx.get('subagents')
+      const agents = runtimeCtx.get('agents') ?? ctx.get('agents')
+      if (!subagents) throw new Error('poc_continuable: no `subagents` service')
+      if (!agents) throw new Error('poc_continuable: no `agents` service')
+
+      const count = Math.max(1, Math.floor(Number(args.count) || 1))
+      const text = typeof args.prompt === 'string' && args.prompt.length > 0
+        ? args.prompt
+        : 'Reply with exactly: POC-OK'
+      const log: string[] = []
+      const childIds: string[] = []
+      log.push('count=' + count + ' hold=' + String(args.hold === true))
+
+      for (let i = 0; i < count; i += 1) {
+        const at = Date.now()
+        let childId: string
+        try {
+          const started = await subagents.startContinuable({
+            provider: 'spawn',
+            label: 'poc-' + (i + 1),
+            request: { prompt: [{ type: 'text', text }], parent },
+            signal: exec.signal,
+          })
+          childId = String(started.childId)
+          childIds.push(childId)
+          log.push('#' + (i + 1) + ' started ' + childId.slice(0, 8) + ' (+' + (Date.now() - at) + 'ms)')
+        } catch (error) {
+          log.push('#' + (i + 1) + ' START FAILED (+' + (Date.now() - at) + 'ms): ' + pocDescribe(error))
+          break
+        }
+        if (args.hold === true) continue
+
+        const agent = agents.get(childId) as PocAgentLike | undefined
+        if (!agent) {
+          log.push('#' + (i + 1) + ' agent handle MISSING for ' + childId.slice(0, 8))
+          continue
+        }
+        try {
+          await agent.whenIdle()
+          log.push('#' + (i + 1) + ' whenIdle done (+' + (Date.now() - at) + 'ms)')
+        } catch (error) {
+          log.push('#' + (i + 1) + ' whenIdle FAILED: ' + pocDescribe(error))
+          continue
+        }
+        try {
+          const events = agent.session.snapshotEvents()
+          const read = pocLastAssistantText(events)
+          log.push('#' + (i + 1) + ' events=' + events.length + ' types=[' + [...new Set(read.kinds)].slice(0, 8).join(',') + ']')
+          log.push('#' + (i + 1) + ' output(' + read.text.length + ')=' + read.text.slice(0, 70).replace(/\n/g, ' '))
+        } catch (error) {
+          log.push('#' + (i + 1) + ' output FAILED: ' + pocDescribe(error))
+        }
+      }
+
+      log.push('created ' + childIds.length + ' children; they stay resident for the UI steer test')
+      return { ok: true, log, childIds }
     },
   }))
 }

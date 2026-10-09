@@ -80,6 +80,34 @@ export interface Config {
      * at the back can hit the client's idle-stream timeout while they wait.
      */
     maxParallel?: number;
+    /**
+     * 計画段階が出してよい子問題の上限（既定 8）。
+     *
+     * ローカルエンジンでは研究者の数がそのまま所要時間になる（直列なので1件≒7分）。
+     * 実測: 15 件で第1ラウンドだけで 105 分かかり、全体 195 分の 54% を占めた。
+     * 上限を下げると比例して短くなる。超えた分は捨てずに**切り詰め**（後述）、
+     * 重要度の高い次元が残るよう計画プロンプトで優先順位を明示している。
+     */
+    maxQuestions?: number;
+    /**
+     * 1ラウンドが生む補充研究の上限（既定 2）。研究の広さのツマミ。
+     *
+     * 実測: 旧既定 4 では第2〜4ラウンドが毎回ぴったり 4 件になり、情報利得で
+     * 自然収束せずラウンド上限まで走り切った（合計 12 件 = 約 57 分）。
+     * 2 にすると補充は絞られ、上限に当たる前に収束しやすくなる。
+     */
+    maxFollowUps?: number;
+    /**
+     * 各研究者が自分の中で回す探索ラウンドの上限（既定 2）。
+     * depth が 1 のときは 1。研究者1件あたりの所要（実測 平均 6.7 分）に効く。
+     */
+    researcherRounds?: number;
+    /**
+     * 一時的な検証用: true で `poc_continuable` ツールを登録する。
+     * continuable な子のライフサイクル（完了検出・出力取得・スロット解放）を
+     * 実機で確かめるための使い捨て経路。検証が終わったらこのフラグごと削除する。
+     */
+    poc?: boolean;
 }
 /** Apply the plugin: register the `deep_research` tool on `ctx.tools`. */
 export declare function apply(ctx: Context, config?: Config): void;

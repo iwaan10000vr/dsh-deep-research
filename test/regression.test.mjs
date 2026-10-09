@@ -613,10 +613,13 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
   assert.strictEqual(req.args.synthesize, true, 'synthesize 默认 true')
   assert.strictEqual(req.args.review, false, 'review 默认 false')
   assert.strictEqual(req.args.maxParallel, 1, 'maxParallel 默认 1（本地引擎串行）')
+  assert.strictEqual(req.args.maxQuestions, 8, 'maxQuestions 默认 8（ローカルの実行時間レバー）')
+  assert.strictEqual(req.args.maxFollowUps, 2, 'maxFollowUps 默认 2（収束しやすくする）')
+  assert.strictEqual(req.args.researcherRounds, 2, 'researcherRounds 默认 2')
   assert.ok(!('models' in req.args), '未配置 models 时不传 models 键')
   assert.ok(!('subagentProvider' in req), '未配置时不传 subagentProvider')
 
-  // 配置透传：models / maxParallel / subagentProvider
+  // 配置透传：models / maxParallel / subagentProvider / 長さノブ
   const { ctx: ctx2, defs: defs2, requests: requests2 } = stubContext({ report: 'r' })
   mod.apply(ctx2, {
     plannerModel: 'pm',
@@ -624,11 +627,17 @@ test('⑤ 参数校验：空 topic / depth>3 抛错，不进入 workflowEngine.s
     maxParallel: 2,
     subagentProvider: 'fork',
     maxTotalAgents: 7,
+    maxQuestions: 3,
+    maxFollowUps: 1,
+    researcherRounds: 4,
   })
   await defs2[0].execute({ topic: 'T', depth: 2 }, stubExec(ctx2))
   const req2 = requests2[0]
   assert.deepEqual(plain(req2.args.models), { planner: 'pm', researcher: 'rm' }, '角色模型透传')
   assert.strictEqual(req2.args.maxParallel, 2)
+  assert.strictEqual(req2.args.maxQuestions, 3, 'maxQuestions 透传')
+  assert.strictEqual(req2.args.maxFollowUps, 1, 'maxFollowUps 透传')
+  assert.strictEqual(req2.args.researcherRounds, 4, 'researcherRounds 透传')
   assert.strictEqual(req2.subagentProvider, 'fork')
   assert.strictEqual(req2.maxTotalAgents, 7)
 
@@ -744,6 +753,145 @@ test('⑧ 引擎解析：插件自身 ctx 优先，Agent 作用域作为回退',
       defs[0].execute({ topic: 'T' }, stubExec(ctx)),
       /mount this plugin inside the preset's `delegation` group/,
       '错误信息应指向 delegation 组这个正确挂载点',
+    )
+  }
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑨ 長さノブ：ローカルで「短く終わる」ための上限が実際に効く
+//    実測の根拠: 質問 15 件で第1ラウンドだけで 105 分、補充 4 件 ×3 ラウンドで
+//    さらに 57 分。ここを絞ることが実行時間の最大のレバー。
+// ════════════════════════════════════════════════════════════════════════════
+test('⑨ 長さノブ：質問数・補充研究・研究者ラウンドの上限が効く', async () => {
+  const mkRes = (n, gaps) => ({
+    confirmed: [{ claim: 'C' + n, source: 's' + n, confidence: 'high' }],
+    uncertain: [],
+    gaps: (gaps ?? []).map((g) => ({ aspect: g, priority: 'high' })),
+  })
+
+  // (a) 計画が出した 12 問 + 盲区 6 件は、maxQuestions で切り詰められる。
+  {
+    const plannedQuestions = Array.from({ length: 12 }, (_, i) => ({ question: 'Q' + (i + 1), dimension: 'd' + i }))
+    const researcher = Array.from({ length: 20 }, (_, i) => mkRes(i + 1, []))
+    const { result, prompts } = await runScript(SCRIPT, {
+      topic: 'T',
+      depth: 1,
+      synthesize: false,
+      review: false,
+      maxParallel: 1,
+      maxQuestions: 8,
+      maxFollowUps: 2,
+      researcherRounds: 1,
+    }, {
+      planner: [() => ({
+        scope: 'S',
+        dimensions: ['d1'],
+        questions: plannedQuestions,
+        coverage_gaps: ['G1', 'G2', 'G3', 'G4', 'G5', 'G6'],
+      })],
+      researcher,
+    })
+    assert.strictEqual(prompts[0].label, '规划', '先に計画')
+    assert.strictEqual(
+      prompts.length - 1,
+      8,
+      '研究者は maxQuestions=8 体だけ（計画 12 + 盲区 6 を切り詰め）',
+    )
+    assert.strictEqual(result.subquestions, 8, '報告の子問題も 8 件')
+    assert.ok(result.report.includes('絞った'), '切り詰めたことを planText に明示する')
+  }
+
+  // (b) maxFollowUps が補充研究の件数を抑える。同じ研究者（毎回 3 件の high
+  //     ギャップを返す）でも、cap の値で総研究者数が変わることを比較で示す。
+  //     depth=2 は 3 ラウンド上限なので、1 + cap + cap が期待値になる。
+  {
+    const run = async (maxFollowUps) => {
+      const researcher = []
+      for (let i = 0; i < 40; i += 1) researcher.push(mkRes(i + 1, ['G' + i + 'a', 'G' + i + 'b', 'G' + i + 'c']))
+      const { result, prompts } = await runScript(SCRIPT, {
+        topic: 'T',
+        questions: [{ question: 'Q1', dimension: 'd' }],
+        depth: 2, // ラウンド上限 3
+        synthesize: false,
+        review: false,
+        maxParallel: 1,
+        maxQuestions: 8,
+        maxFollowUps,
+        researcherRounds: 1,
+      }, { researcher })
+      assert.strictEqual(result.rounds, 3, 'ラウンド上限 3 まで走る')
+      return prompts.length
+    }
+    assert.strictEqual(await run(1), 3, 'cap=1 → 1+1+1 = 3 体')
+    assert.strictEqual(await run(2), 5, 'cap=2 → 1+2+2 = 5 体')
+    // cap=4 は第1ラウンドのギャップが 3 件しか無いので 1→3、第2ラウンドで
+    // 9 件出て初めて cap に達する: 1+3+4 = 8 体。cap は補充の「増殖」を
+    // 抑えるが、抑えきれないと上限まで走る（だから既定は 2 にしてある）。
+    assert.strictEqual(await run(4), 8, 'cap=4 → 1+3+4 = 8 体')
+  }
+
+  // (b2) 補充が尽きれば上限に達する前に自然収束する。
+  {
+    const { result, prompts } = await runScript(SCRIPT, {
+      topic: 'T',
+      questions: [{ question: 'Q1', dimension: 'd' }],
+      depth: 3, // 4 ラウンドまで許す
+      synthesize: false,
+      review: false,
+      maxParallel: 1,
+      maxQuestions: 8,
+      maxFollowUps: 2,
+      researcherRounds: 1,
+    }, {
+      researcher: [
+        mkRes(1, ['A1', 'A2', 'A3']), // → 補充 2 件
+        mkRes(2, []),                 // ギャップなし
+        mkRes(3, []),                 // ギャップなし
+      ],
+    })
+    assert.strictEqual(result.rounds, 2, 'ギャップが尽きたら 4 ラウンド目を待たず収束する')
+    assert.strictEqual(prompts.length, 3, '1 + 2 = 3 体で終わる')
+  }
+
+  // (c) depth=1 なら研究者の内部探索ラウンドは 1（LIMIT）になる。
+  {
+    const { prompts } = await runScript(SCRIPT, {
+      topic: 'T',
+      questions: [{ question: 'Q1', dimension: 'd' }],
+      depth: 1,
+      synthesize: false,
+      review: false,
+      maxParallel: 1,
+      maxQuestions: 8,
+      maxFollowUps: 2,
+      researcherRounds: 2,
+    }, {
+      researcher: [mkRes(1, [])],
+    })
+    assert.ok(
+      prompts[0].prompt.includes('最多 1 轮搜索'),
+      'depth=1 は研究者の探索を 1 ラウンドに制限する（prompt に反映）',
+    )
+  }
+
+  // (d) researcherRounds が depth>1 のとき研究者プロンプトに反映される。
+  {
+    const { prompts } = await runScript(SCRIPT, {
+      topic: 'T',
+      questions: [{ question: 'Q1', dimension: 'd' }],
+      depth: 2,
+      synthesize: false,
+      review: false,
+      maxParallel: 1,
+      maxQuestions: 8,
+      maxFollowUps: 2,
+      researcherRounds: 3,
+    }, {
+      researcher: [mkRes(1, [])],
+    })
+    assert.ok(
+      prompts[0].prompt.includes('最多 3 轮搜索'),
+      'researcherRounds=3 が研究者プロンプトに反映される',
     )
   }
 })
