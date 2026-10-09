@@ -925,8 +925,8 @@ interface SubagentsForChildrenLike {
 /** 進捗の行き先。ジョブが無いときは何もしない実装を渡す。 */
 interface ProgressSink {
   phase(title: string): void
-  childStart(label: string): void
-  childEnd(label: string, outcome: string): void
+  childStart(label: string, childId: string): void
+  childEnd(label: string, outcome: string, childId: string): void
   log(message: string): void
 }
 
@@ -939,22 +939,21 @@ function silentProgress(): ProgressSink {
     log: () => void 0,
   }
 }
-
 /** ジョブへ直接書く進捗。workflow/* を経由しないので、エンジン無しでも見える。 */
 function jobProgress(job: JobHandleLike): ProgressSink {
-  let seq = 0
   return {
     phase: (title) => {
       job.append('== ' + title + ' ==\n')
       job.updateProgress(title)
     },
-    childStart: (label) => {
-      seq += 1
-      job.append('  > #' + seq + ' ' + label + ' 開始\n')
+    // childId を必ず出す。実行中の研究者に人間が指示を送るには対象の特定が要る
+    // （UI のサブエージェント一覧でも見えるが、進捗と突き合わせられると確実）。
+    childStart: (label, childId) => {
+      job.append('  > ' + label + ' 開始  子 ' + childId + '\n')
       job.updateProgress(label)
     },
-    childEnd: (label, outcome) => {
-      job.append('  v ' + label + ' ' + outcome + '\n')
+    childEnd: (label, outcome, childId) => {
+      job.append('  v ' + label + ' ' + outcome + '  子 ' + childId + '\n')
     },
     log: (message) => { job.append(message + '\n') },
   }
@@ -1095,7 +1094,6 @@ async function runContinuableChild(
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const label = input.label + (attempt > 1 ? '（再試行' + attempt + '）' : '')
     let childId = ''
-    deps.progress.childStart(label)
     try {
       const started = await deps.subagents.startContinuable({
         provider: deps.provider,
@@ -1108,9 +1106,11 @@ async function runContinuableChild(
         signal: deps.signal,
       })
       childId = String(started.childId)
+      // childId が確定してから進捗に出す（実行中の研究者を特定できるように）。
+      deps.progress.childStart(label, childId)
       const child = deps.agents.get(childId) as ContinuableChildLike | undefined
       if (child === undefined) {
-        deps.progress.childEnd(label, 'failed (no agent handle)')
+        deps.progress.childEnd(label, 'failed (no agent handle)', childId)
         errors.push('子のハンドルが取得できなかった')
         continue
       }
@@ -1119,23 +1119,23 @@ async function runContinuableChild(
 
       if (!structured) {
         const text = extractFinalAssistantText(events)
-        deps.progress.childEnd(label, text.length > 0 ? 'completed' : 'completed (empty)')
+        deps.progress.childEnd(label, text.length > 0 ? 'completed' : 'completed (empty)', childId)
         return { ok: text.length > 0, text, childId, errors }
       }
 
       const recovered = recoverStructuredOutput(events, input.schema)
       if (recovered.ok) {
-        deps.progress.childEnd(label, 'completed')
+        deps.progress.childEnd(label, 'completed', childId)
         return { ok: true, text: recovered.text, value: recovered.value, childId, errors }
       }
       // 検証に落ちた理由は残す。次の試行で同じ失敗を繰り返さないための手掛かり。
       errors.push(...recovered.errors)
-      deps.progress.childEnd(label, 'invalid (' + recovered.errors[0] + ')')
+      deps.progress.childEnd(label, 'invalid (' + recovered.errors[0] + ')', childId)
       deps.progress.log('  再試行します: ' + recovered.errors.join('; '))
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       errors.push(message)
-      deps.progress.childEnd(label, 'error (' + message + ')')
+      deps.progress.childEnd(label, 'error (' + message + ')', childId)
     } finally {
       // 常駐枠を必ず返す。失敗した子も残さない。
       if (childId.length > 0) {

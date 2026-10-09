@@ -1717,6 +1717,15 @@ test('⑯ continuable 経路：子を作り、破棄し、不正なら作り直�
     assert.ok(handle.appends.some((a) => a.text.includes('== 研究·第1轮 ==')), '研究フェーズが見出しで出る')
     assert.ok(handle.appends.some((a) => a.text.includes('開始')), '研究者の開始が出る')
     assert.ok(handle.appends.some((a) => a.text.includes('completed')), '研究者の終了が出る')
+    // 実行中の研究者に人間が指示を送るには対象の特定が要る。
+    assert.ok(
+      handle.appends.some((a) => a.text.includes('child-1')),
+      '進捗に childId が出る（実行中の研究者を特定できる）',
+    )
+    assert.ok(
+      handle.appends.some((a) => a.text.includes('開始') && a.text.includes('child-1')),
+      '開始行に childId が付く',
+    )
     const settled = await started[0].settled
     assert.strictEqual(settled.status, 'completed', 'ジョブは completed で決着する')
   }
