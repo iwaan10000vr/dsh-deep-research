@@ -373,7 +373,7 @@ function evaluateModuleInVm() {
   src = stripTypeScriptTypes(src) // throws on non-erasable syntax — keeps the source portable
   src = src.replace("import { defineTool } from '@deepseek-ai/dsh-tools'", '')
   src = src.replaceAll(/\bexport\s+/g, '')
-  src += '\n;globalThis.__drExports = { name, inject, apply, SCRIPT, PLANNER_SCHEMA, RESEARCHER_SCHEMA, parseQuestionList, looksLikeInstruction }\n'
+  src += '\n;globalThis.__drExports = { name, inject, apply, SCRIPT, PLANNER_SCHEMA, RESEARCHER_SCHEMA, parseQuestionList, looksLikeInstruction, extractFinalAssistantText, registerPocTool }\n'
   const defs = []
   const context = vm.createContext({
     // 镜像 defineTool 的编译契约（dsh-tools schema.ts 子集）：
@@ -614,6 +614,8 @@ function stubContext(value, options = {}) {
     get: (name) => {
       if (name === 'workflowEngine' && engineOnCtx) return workflowEngine
       if (name === 'jobs' && options.jobs !== undefined) return options.jobs
+      if (name === 'subagents' && options.subagents !== undefined) return options.subagents
+      if (name === 'agents' && options.agents !== undefined) return options.agents
       return undefined
     },
   }
@@ -621,6 +623,8 @@ function stubContext(value, options = {}) {
     get: (name) => {
       if (name === 'workflowEngine' && engineOnAgent) return workflowEngine
       if (name === 'jobs' && options.jobs !== undefined) return options.jobs
+      if (name === 'subagents' && options.subagents !== undefined) return options.subagents
+      if (name === 'agents' && options.agents !== undefined) return options.agents
       return undefined
     },
   }
@@ -1188,3 +1192,138 @@ test('⑫ ジョブミラー：進捗を写し、中止でき、必ず決着す�
 function stubDefsExecute(stub, args, exec) {
   return stub.defs[0].execute(args, exec)
 }
+
+/**
+ * PoC 用の偽 `subagents` / `agents`。
+ * - startContinuable: spec を捕捉し、`{childId, messageId}` を返す（実機と同じ形）。
+ * - drainContinuableChildren: 呼び出しを記録する（スロット解放の検証用）。
+ * - agents.get(childId): whenIdle と session.snapshotEvents を提供する子ハンドル。
+ *
+ * @param events childId -> 子のイベント列（snapshotEvents が返すもの）
+ */
+function stubSubagents(events = {}) {
+  let n = 0
+  const started = []
+  const drained = []
+  const subagents = {
+    startContinuable: async (spec) => {
+      n += 1
+      const childId = 'child-' + n
+      started.push({ spec, childId })
+      return { childId, messageId: 'msg-' + n }
+    },
+    drainContinuableChildren: async (parent, childIds) => {
+      drained.push({ parent, childIds })
+    },
+  }
+  const agents = {
+    get: (childId) => {
+      if (!(childId in events)) return undefined
+      return {
+        whenIdle: async () => {},
+        session: { snapshotEvents: () => events[childId] },
+      }
+    },
+  }
+  return { subagents, agents, started, drained }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑬ 子の最終出力の抽出：実測で確定させた契約を固定する
+//    実装（@deepseek-ai/dsh-subagent の AssistantOutputFold /
+//    joinAssistantStreamText）を読んで確定させた形は:
+//      確定本文 = event.data.message.content（ブロック配列）
+//      途中経過 = event.data.stream（text-chunks / chunk:text-delta）
+//      選択規則 = 最後の非空 assistant メッセージ本文、無ければ stream の連結
+//    素朴に `event.data.content` を読むと**必ず空になる**（PoC で一度この誤りを書いた）。
+// ════════════════════════════════════════════════════════════════════════════
+test('⑬ 子の最終出力の抽出：message.content を読み、stream にフォールバックする', async () => {
+  const { mod } = await loadPlugin()
+
+  /** poc_continuable を 1 体だけ実行して、その結果を返す。 */
+  const runPoc = async (childEvents) => {
+    const fake = stubSubagents({ 'child-1': childEvents })
+    const stub = stubContext({ report: 'r' }, { subagents: fake.subagents, agents: fake.agents })
+    mod.apply(stub.ctx, { poc: true })
+    const poc = stub.defs.find((d) => d.name === 'poc_continuable')
+    assert.ok(poc !== undefined, 'config.poc:true で poc_continuable が登録される')
+    const out = await poc.execute({ count: 1, prompt: 'x' }, stubExec(stub.ctx))
+    return { out, fake }
+  }
+
+  // (a) 正しい形: data.message.content を最終出力として読む。
+  {
+    const events = [
+      { type: 'user/message', data: { message: { content: [{ type: 'text', text: 'prompt' }] } } },
+      { type: 'assistant/attempt', data: { stream: [{ type: 'text-chunks', texts: ['考', 'え中'] }] } },
+      { type: 'assistant/message', data: {
+        message: { content: [{ type: 'text', text: 'FINAL-ANSWER' }] },
+        stream: [{ type: 'chunk', chunk: { type: 'text-delta', text: 'FINAL-ANSWER' } }],
+      } },
+    ]
+    const { out } = await runPoc(events)
+    assert.strictEqual(out.ok, true)
+    assert.ok(
+      out.log.some((l) => l.includes('FINAL-ANSWER')),
+      'data.message.content から最終出力を取り出す（実際のログ: ' + JSON.stringify(out.log) + '）',
+    )
+    assert.ok(
+      out.log.some((l) => l.includes('assistant/message')),
+      '観測したイベント種別をログに出す（契約の確認用）',
+    )
+  }
+
+  // (b) フォールバック: assistant/message の本文が空なら stream を連結する。
+  {
+    const events = [
+      { type: 'assistant/message', data: { message: { content: [] }, stream: [{ type: 'text-chunks', texts: ['stream-', 'only'] }] } },
+    ]
+    const { out } = await runPoc(events)
+    assert.ok(
+      out.log.some((l) => l.includes('stream-only')),
+      '本文が空なら stream の連結にフォールバックする',
+    )
+  }
+
+  // (c) 罠: data.content（間違った形）しか無ければ空になる。この誤りを回帰で防ぐ。
+  {
+    const events = [
+      { type: 'assistant/message', data: { content: [{ type: 'text', text: 'WRONG-SHAPE' }] } },
+    ]
+    const { out } = await runPoc(events)
+    assert.ok(
+      !out.log.some((l) => l.includes('WRONG-SHAPE')),
+      'data.content は読まない（data.message.content が正しい形）',
+    )
+    assert.ok(
+      out.log.some((l) => l.includes('output(0)')),
+      '誤った形では出力長 0 になることを明示する',
+    )
+  }
+
+  // (d) drain:true でスロット解放を呼ぶ（実装で確認済みの唯一の解放経路）。
+  {
+    const fake = stubSubagents({ 'child-1': [{ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } }] })
+    const stub = stubContext({ report: 'r' }, { subagents: fake.subagents, agents: fake.agents })
+    mod.apply(stub.ctx, { poc: true })
+    const poc = stub.defs.find((d) => d.name === 'poc_continuable')
+    const out = await poc.execute({ count: 1, prompt: 'x', drain: true }, stubExec(stub.ctx))
+    assert.strictEqual(out.ok, true)
+    assert.strictEqual(fake.drained.length, 1, 'drain:true は子を破棄する')
+    assert.deepEqual(fake.drained[0].childIds, ['child-1'], '破棄対象は作った子そのもの')
+    assert.ok(out.log.some((l) => l.includes('drained')), '解放したことをログに出す')
+  }
+
+  // (e) hold:true は完了を待たずに childId を返す（UI Steer 検証用）。
+  {
+    const fake = stubSubagents({ 'child-1': [] })
+    const stub = stubContext({ report: 'r' }, { subagents: fake.subagents, agents: fake.agents })
+    mod.apply(stub.ctx, { poc: true })
+    const poc = stub.defs.find((d) => d.name === 'poc_continuable')
+    const out = await poc.execute({ count: 2, prompt: 'x', hold: true }, stubExec(stub.ctx))
+    assert.strictEqual(out.ok, true)
+    assert.deepEqual(out.childIds, ['child-1', 'child-2'], 'hold は 2 体ぶんの childId を返す')
+    assert.ok(!out.log.some((l) => l.includes('whenIdle')), 'hold では完了を待たない')
+    assert.strictEqual(fake.started.length, 2, '常駐上限（8）まで作れる')
+  }
+})

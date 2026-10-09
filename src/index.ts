@@ -824,22 +824,84 @@ export function apply(ctx: Context, config: Config = {}) {
 //
 // 検証が終わったらこの節と Config.poc を削除する。
 
-/** 子のイベント列から、最後の assistant テキストを取り出す試作。 */
-function pocLastAssistantText(events: readonly unknown[]): { text: string; kinds: string[] } {
-  let text = ''
-  const kinds: string[] = []
-  for (const raw of events) {
-    const event = raw as { type?: unknown; data?: unknown }
-    if (typeof event?.type === 'string') kinds.push(event.type)
-    if (event?.type !== 'assistant/message') continue
-    const data = event.data as { content?: unknown } | undefined
-    if (!data || !Array.isArray(data.content)) continue
-    for (const block of data.content) {
-      const part = block as { type?: unknown; text?: unknown }
-      if (part?.type === 'text' && typeof part.text === 'string') text = part.text
+// ── 子の最終出力を取り出す（実測で確定させた契約） ──────────────────────────
+//
+// `@deepseek-ai/dsh-subagent` の AssistantOutputFold / joinAssistantStreamText の
+// 忠実な移植。実装を読んで確定させた形は次のとおりで、素朴に `data.content` を
+// 読むと**必ず空になる**（PoC で一度この誤りを書いた）:
+//
+//   - 確定した本文は `event.data.message.content`（ブロックの配列）
+//   - 途中経過は `event.data.stream` に text-chunks / chunk:text-delta として入る
+//   - 選択規則: 最後の非空 assistant メッセージ本文。無ければ stream の連結
+//
+// 選択規則を自前で持つ理由: continuable な子では outputSchema が使えないため
+// （ContinuableStartSpec が構造的に除外している）、出力の解釈はこちら側の責任になる。
+
+/** `event.data.stream` の記録から、テキスト断片を連結する。 */
+function joinAssistantStream(stream: unknown): string {
+  if (!Array.isArray(stream)) return ''
+  const parts: string[] = []
+  for (const raw of stream) {
+    const record = raw as { type?: unknown; texts?: unknown; chunk?: unknown }
+    if (record?.type === 'text-chunks' && Array.isArray(record.texts)) {
+      parts.push(record.texts.map(String).join(''))
+      continue
+    }
+    if (record?.type === 'chunk') {
+      const chunk = record.chunk as { type?: unknown; text?: unknown } | undefined
+      if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') parts.push(chunk.text)
     }
   }
-  return { text, kinds }
+  return parts.join('')
+}
+
+/** 出力ブロックの配列から、text ブロックだけを連結する。 */
+function textOfContentBlocks(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  let text = ''
+  for (const raw of content) {
+    const block = raw as { type?: unknown; text?: unknown }
+    if (block?.type === 'text' && typeof block.text === 'string') text += block.text
+  }
+  return text
+}
+
+/**
+ * 子のイベント列（activation boundary 以降）から最終出力テキストを選ぶ。
+ *
+ * AssistantOutputFold.collect() と同じ規則:
+ *   1. 最後の非空 `assistant/message` の本文
+ *   2. それが無ければ `assistant/message` / `assistant/attempt` の stream を連結
+ *   3. どちらも無ければ空文字
+ */
+function extractFinalAssistantText(events: readonly unknown[]): string {
+  let message = ''
+  const partial: string[] = []
+  for (const raw of events) {
+    const event = raw as { type?: unknown; data?: unknown }
+    const type = event?.type
+    if (type === 'assistant/message') {
+      const data = event.data as { message?: { content?: unknown } } | undefined
+      const text = textOfContentBlocks(data?.message?.content)
+      if (text.length > 0) message = text
+    }
+    if (type === 'assistant/message' || type === 'assistant/attempt') {
+      const data = event.data as { stream?: unknown } | undefined
+      const joined = joinAssistantStream(data?.stream)
+      if (joined.length > 0) partial.push(joined)
+    }
+  }
+  return message.length > 0 ? message : partial.join('')
+}
+
+/** 子のイベント列から、最後の assistant テキストを取り出す試作。 */
+function pocLastAssistantText(events: readonly unknown[]): { text: string; kinds: string[] } {
+  const kinds: string[] = []
+  for (const raw of events) {
+    const event = raw as { type?: unknown }
+    if (typeof event?.type === 'string') kinds.push(event.type)
+  }
+  return { text: extractFinalAssistantText(events), kinds }
 }
 
 function pocDescribe(error: unknown): string {
