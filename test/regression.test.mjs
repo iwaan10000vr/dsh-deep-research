@@ -373,7 +373,7 @@ function evaluateModuleInVm() {
   src = stripTypeScriptTypes(src) // throws on non-erasable syntax — keeps the source portable
   src = src.replace("import { defineTool } from '@deepseek-ai/dsh-tools'", '')
   src = src.replaceAll(/\bexport\s+/g, '')
-  src += '\n;globalThis.__drExports = { name, inject, apply, SCRIPT, PLANNER_SCHEMA, RESEARCHER_SCHEMA, parseQuestionList, looksLikeInstruction, extractFinalAssistantText, registerPocTool }\n'
+  src += '\n;globalThis.__drExports = { name, inject, apply, SCRIPT, PLANNER_SCHEMA, RESEARCHER_SCHEMA, parseQuestionList, looksLikeInstruction, extractFinalAssistantText, extractJsonValue, checkSchema, recoverStructuredOutput, registerPocTool }\n'
   const defs = []
   const context = vm.createContext({
     // 镜像 defineTool 的编译契约（dsh-tools schema.ts 子集）：
@@ -1417,4 +1417,132 @@ test('⑭ 実ログの payload：text の無い assistant を飛ばして最後�
   // 採取元と同じ構造（message.content）であることも直接確認する。
   const direct = mod.extractFinalAssistantText(realEvents)
   assert.strictEqual(direct, 'POC-OK', 'extractFinalAssistantText が実 payload から本文を選ぶ')
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑮ 構造化出力の回収：continuable な子に outputSchema は無いので、ここが担保
+//
+// ContinuableStartSpec は outputSchema を構造的に持てず、捕捉ツールを差し込む
+// setup / attachStructuredRuntime にも startContinuable からは到達できない
+// （実装を読んで確認済み）。よって子には「最後に JSON だけを出せ」と頼み、
+// 抽出の頑健さ（説明文・フェンス・入れ子）と検証の厳しさ（型・必須・enum・
+// 余分なキー）で担保する。抽出も検証も失敗したら**その子は失敗**として扱い、
+// 壊れた値を下流に混ぜない。
+// ════════════════════════════════════════════════════════════════════════════
+test('⑮ 構造化出力の回収：頑健に抽出し、厳しく検証し、失敗を隠さない', async () => {
+  const { mod } = await loadPlugin()
+  const { extractJsonValue, checkSchema, recoverStructuredOutput, RESEARCHER_SCHEMA } = mod
+
+  /** 子の最終出力を 1 つ作る（実機と同じ `data.message.content` の形）。 */
+  const childText = (text) => [{
+    type: 'assistant/message',
+    seq: 1,
+    data: { message: { content: [{ type: 'text', text }] } },
+  }]
+
+  const good = {
+    confirmed: [{ claim: 'C1', source: 'https://example.com/a', confidence: 'high' }],
+    uncertain: [{ point: 'P1', reason: 'R1' }],
+    gaps: [{ aspect: 'A1', priority: 'medium' }],
+  }
+
+  // (a) 素の JSON。
+  assert.deepStrictEqual(extractJsonValue(JSON.stringify(good)), good, '素の JSON を解析する')
+
+  // (b) コードフェンス。子はよくこれを使う。
+  assert.deepStrictEqual(
+    extractJsonValue('調査しました。\n\n```json\n' + JSON.stringify(good, null, 2) + '\n```\n\n以上です。'),
+    good,
+    'フェンス内の JSON を解析する',
+  )
+
+  // (c) 前後に説明文があり、フェンスが無い場合も波括弧対応で切り出す。
+  assert.deepStrictEqual(
+    extractJsonValue('結果は次のとおりです。 ' + JSON.stringify(good) + ' ご確認ください。'),
+    good,
+    '説明文に囲まれた JSON を切り出す',
+  )
+
+  // (d) 文字列リテラル内の波括弧とエスケープに引っかからないこと。
+  {
+    const tricky = { confirmed: [{ claim: '記号 {} と \\" を含む', source: 's', confidence: 'low' }] }
+    assert.deepStrictEqual(
+      extractJsonValue('答え: ' + JSON.stringify(tricky)),
+      tricky,
+      '文字列内の波括弧・エスケープで壊れない',
+    )
+  }
+
+  // (e) 入れ子が深くても、最初の完全なオブジェクトで止まる。
+  {
+    const nested = { a: { b: { c: [1, 2, { d: '}' }] } } }
+    assert.deepStrictEqual(
+      extractJsonValue('x ' + JSON.stringify(nested) + ' y {"z":1}'),
+      nested,
+      '最初の完全なオブジェクトだけを取る',
+    )
+  }
+
+  // (f) JSON が無ければ undefined（例外にしない）。
+  assert.strictEqual(extractJsonValue('JSON はありません。'), undefined, 'JSON が無ければ undefined')
+  assert.strictEqual(extractJsonValue(''), undefined, '空文字は undefined')
+
+  // (g) 検証: 正しい値は通る。
+  assert.deepStrictEqual(checkSchema(RESEARCHER_SCHEMA, good), [], '正しい構造は通る')
+
+  // (h) 検証は緩めない: 型違い・enum 外・必須欠落・余分なキーをすべて弾く。
+  assert.ok(checkSchema(RESEARCHER_SCHEMA, { confirmed: 'not-an-array' }).length > 0, '型違いを弾く')
+  assert.ok(
+    checkSchema(RESEARCHER_SCHEMA, { confirmed: [{ claim: 'C', source: 's', confidence: 'very-high' }] }).length > 0,
+    'enum 外の confidence を弾く',
+  )
+  assert.ok(
+    checkSchema(RESEARCHER_SCHEMA, { confirmed: [{ confidence: 'high' }] }).length > 0,
+    '必須（claim / source）の欠落を弾く',
+  )
+  assert.ok(checkSchema(RESEARCHER_SCHEMA, {}).length > 0, 'required の欠落を弾く')
+  assert.ok(
+    checkSchema(RESEARCHER_SCHEMA, { confirmed: [], extra: 1 }).length > 0,
+    'additionalProperties:false で余分なキーを弾く',
+  )
+  assert.ok(
+    checkSchema(RESEARCHER_SCHEMA, { confirmed: [{ claim: 'C', source: 's', confidence: 'high' }], gaps: [{ priority: 'high' }] }).length > 0,
+    '入れ子の必須欠落も弾く',
+  )
+
+  // (i) 回収の3つの帰結: 成功 / 抽出失敗 / 検証失敗。失敗は理由つきで返し、隠さない。
+  {
+    const ok = recoverStructuredOutput(childText('```json\n' + JSON.stringify(good) + '\n```'), RESEARCHER_SCHEMA)
+    assert.strictEqual(ok.ok, true, '正しい出力は成功する')
+    assert.deepStrictEqual(ok.value, good, '値がそのまま返る')
+    assert.strictEqual(ok.value.confirmed[0].claim, 'C1', '入れ子も参照できる')
+  }
+  {
+    const noJson = recoverStructuredOutput(childText('調べましたが JSON は出しません。'), RESEARCHER_SCHEMA)
+    assert.strictEqual(noJson.ok, false, 'JSON が無ければ失敗')
+    assert.ok(noJson.errors.length > 0, '理由を返す')
+    assert.strictEqual(noJson.text, '調べましたが JSON は出しません。', '生の出力も返す（診断用）')
+  }
+  {
+    const bad = recoverStructuredOutput(childText(JSON.stringify({ confirmed: [{ claim: 'C' }] })), RESEARCHER_SCHEMA)
+    assert.strictEqual(bad.ok, false, '検証に落ちたら失敗')
+    assert.ok(bad.errors.some((e) => e.includes('source')), 'どのキーが問題かを理由に含める')
+  }
+  {
+    const empty = recoverStructuredOutput([], RESEARCHER_SCHEMA)
+    assert.strictEqual(empty.ok, false, '出力が無ければ失敗')
+  }
+
+  // (j) スキーマはプランナー／研究者の両方で使える（同じ検証器を共有する）。
+  {
+    const planner = {
+      scope: 'S', dimensions: ['d1'], coverage_gaps: [],
+      questions: [{ question: 'Q1', dimension: 'd1' }],
+    }
+    assert.deepStrictEqual(checkSchema(mod.PLANNER_SCHEMA, planner), [], 'プランナースキーマも検証できる')
+    assert.ok(
+      checkSchema(mod.PLANNER_SCHEMA, { ...planner, questions: [{ dimension: 'd1' }] }).length > 0,
+      'プランナーの必須も弾く',
+    )
+  }
 })

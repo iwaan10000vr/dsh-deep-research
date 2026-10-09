@@ -109,6 +109,112 @@ export interface Config {
      */
     poc?: boolean;
 }
+/** Planner structured output: answer space + dimension coverage + questions. */
+export declare const PLANNER_SCHEMA: {
+    type: string;
+    additionalProperties: boolean;
+    properties: {
+        scope: {
+            type: string;
+        };
+        dimensions: {
+            type: string;
+            items: {
+                type: string;
+            };
+        };
+        questions: {
+            type: string;
+            items: {
+                type: string;
+                additionalProperties: boolean;
+                properties: {
+                    question: {
+                        type: string;
+                    };
+                    dimension: {
+                        type: string;
+                    };
+                    keywords: {
+                        type: string;
+                    };
+                    acceptance: {
+                        type: string;
+                    };
+                };
+                required: string[];
+            };
+        };
+        coverage_gaps: {
+            type: string;
+            items: {
+                type: string;
+            };
+        };
+    };
+    required: string[];
+};
+/** Researcher structured output: the three-state evidence model (entropy tracking). */
+export declare const RESEARCHER_SCHEMA: {
+    type: string;
+    additionalProperties: boolean;
+    properties: {
+        confirmed: {
+            type: string;
+            items: {
+                type: string;
+                additionalProperties: boolean;
+                properties: {
+                    claim: {
+                        type: string;
+                    };
+                    source: {
+                        type: string;
+                    };
+                    confidence: {
+                        type: string;
+                        enum: string[];
+                    };
+                };
+                required: string[];
+            };
+        };
+        uncertain: {
+            type: string;
+            items: {
+                type: string;
+                additionalProperties: boolean;
+                properties: {
+                    point: {
+                        type: string;
+                    };
+                    reason: {
+                        type: string;
+                    };
+                };
+                required: string[];
+            };
+        };
+        gaps: {
+            type: string;
+            items: {
+                type: string;
+                additionalProperties: boolean;
+                properties: {
+                    aspect: {
+                        type: string;
+                    };
+                    priority: {
+                        type: string;
+                        enum: string[];
+                    };
+                };
+                required: string[];
+            };
+        };
+    };
+    required: string[];
+};
 /** Apply the plugin: register the `deep_research` tool on `ctx.tools`. */
 export declare function apply(ctx: Context, config?: Config): void;
 /**
@@ -124,4 +230,41 @@ export declare function apply(ctx: Context, config?: Config): void;
  * 単体で検証できるよう export している（cordis の plugin 契約は name/inject/apply）。
  */
 export declare function extractFinalAssistantText(events: readonly unknown[]): string;
+/**
+ * テキストから最初の完全な JSON オブジェクトを取り出す。
+ *
+ * 子は説明文やコードフェンスを前後に付けがちなので、素朴な `JSON.parse` では
+ * 落ちる。次の順に試す:
+ *   1. ```json … ``` / ``` … ``` のフェンス内
+ *   2. 波括弧の対応を数えて最初の完全な `{…}` を切り出す（文字列リテラル内の
+ *      波括弧とエスケープを正しく飛ばす）
+ *   3. 全文そのもの
+ *
+ * @returns 解析できた値。できなければ `undefined`。
+ */
+export declare function extractJsonValue(text: string): unknown;
+/**
+ * このプラグインが使う範囲の JSON Schema 検証（object / array / string /
+ * number / integer / boolean / enum / required / additionalProperties）。
+ *
+ * DSH の `assertObjectJsonSchema` は `dsh-tools` の内部で、ここからは参照
+ * できないため、必要な部分だけを持つ。**検証は緩めない**方針: 型が違えば
+ * 失敗にし、子の出力を勝手に補正しない（補正は誤りを隠す）。
+ */
+export declare function checkSchema(schema: unknown, value: unknown, path?: string): string[];
+/**
+ * 子の最終出力から、スキーマに合う JSON オブジェクトを回収する。
+ *
+ * 子は `outputSchema` を持てないので、ここが唯一の担保になる。抽出に失敗した
+ * 場合と検証に落ちた場合を区別して返し、呼び出し側が再試行や失敗扱いを選べる
+ * ようにする（黙って部分的に使うことはしない）。
+ */
+export declare function recoverStructuredOutput(events: readonly unknown[], schema: unknown): {
+    ok: true;
+    value: Record<string, unknown>;
+} | {
+    ok: false;
+    errors: string[];
+    text: string;
+};
 //# sourceMappingURL=index.d.ts.map
