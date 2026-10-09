@@ -566,37 +566,97 @@ function checkValue(node, value, path, violations) {
  * 组内，只有同一 isolate 领域内的消费者能看到）。解析顺序是「插件自己的 ctx → 调用方
  * Agent 的 ctx」，所以 stub 必须让其中至少一个的 get('workflowEngine') 可解析。
  *
+ * `on(...)` 收集监听器，测试可用 `emitWorkflow(type, ...payload)` 触发——
+ * ジョブミラー（workflow/* → ctx.jobs）の検証に必要。
+ *
  * @param value 脚本返回值
  * @param options.engineOnCtx 是否把引擎挂在插件自己的 ctx 上（默认 true）
  * @param options.engineOnAgent 是否把引擎挂在 Agent 的 ctx 上（默认 true）
+ * @param options.jobs 伪 ctx.jobs（省略时不提供 jobs 服务 = 従来動作）
  */
 function stubContext(value, options = {}) {
   const engineOnCtx = options.engineOnCtx ?? true
   const engineOnAgent = options.engineOnAgent ?? true
   const defs = []
   const requests = []
+  const listeners = new Map()
+  const engineControl = { resolve: null, reject: null }
   const workflowEngine = {
     start: (request) => {
       requests.push(request)
+      // deferResult: 実機と同じ順序を再現するため、result を保留する。
+      // 実際のエンジンも start() の戻りで run.id が確定し、phase などの
+      // イベントはその後に来る（スクリプト本体は非同期に走る）。
+      let result
+      if (options.deferResult === true) {
+        const deferred = Promise.withResolvers()
+        engineControl.resolve = (value, stopReason = 'completed') => deferred.resolve({ stopReason, value })
+        result = deferred.promise
+      } else {
+        result = Promise.resolve({ stopReason: 'completed', value })
+      }
       return {
-        result: Promise.resolve({ stopReason: 'completed', value }),
+        id: options.runId ?? 'run-1',
+        result,
         cancel: () => {},
         dispose: async () => {},
-        id: 'run-1',
       }
     },
   }
   const ctx = {
     tools: { register: (def) => defs.push(def) },
+    on: (type, handler) => {
+      if (!listeners.has(type)) listeners.set(type, [])
+      listeners.get(type).push(handler)
+    },
     ...(engineOnCtx ? { workflowEngine } : {}),
-    get: (name) => (name === 'workflowEngine' && engineOnCtx ? workflowEngine : undefined),
+    ...(options.jobs !== undefined ? { jobs: options.jobs } : {}),
+    get: (name) => {
+      if (name === 'workflowEngine' && engineOnCtx) return workflowEngine
+      if (name === 'jobs' && options.jobs !== undefined) return options.jobs
+      return undefined
+    },
   }
-  const agentCtx = { get: (name) => (name === 'workflowEngine' && engineOnAgent ? workflowEngine : undefined) }
-  return { ctx, agentCtx, defs, requests, workflowEngine }
+  const agentCtx = {
+    get: (name) => {
+      if (name === 'workflowEngine' && engineOnAgent) return workflowEngine
+      if (name === 'jobs' && options.jobs !== undefined) return options.jobs
+      return undefined
+    },
+  }
+  /** 登録済みの workflow/* リスナーを発火する。 */
+  const emitWorkflow = (type, ...payload) => {
+    for (const handler of listeners.get(type) ?? []) handler(...payload)
+  }
+  return { ctx, agentCtx, defs, requests, workflowEngine, emitWorkflow, engineControl }
+}
+
+/**
+ * 偽の `ctx.jobs`。start(spec) が spec を捕捉し、その `run(handle)` を呼んで
+ * handle（append / updateProgress を記録）と、決着を待てる promise を返す。
+ */
+function stubJobs() {
+  const started = []
+  const jobs = {
+    start: (spec) => {
+      const handle = { appends: [], progress: [] }
+      handle.append = (text, opts) => handle.appends.push({ text, opts })
+      handle.updateProgress = (line) => handle.progress.push(line)
+      const entry = { spec, handle, settled: null }
+      const result = Promise.withResolvers()
+      entry.settled = result.promise
+      const hooks = spec.run(handle)
+      entry.hooks = hooks
+      hooks.done.then((outcome) => result.resolve(outcome))
+      started.push(entry)
+      return 'job-' + started.length
+    },
+  }
+  return { jobs, started }
 }
 
 /** 构造调用了插件工具的 exec；引擎按 options 决定挂在谁的作用域上。 */
-function stubExec(ctx, signal = new EventTarget()) {
+function stubExec(ctx, signal = new AbortController().signal) {
   return { agent: { id: 'parent', ctx }, signal }
 }
 
@@ -1033,3 +1093,98 @@ test('⑪ 呼び出し側 questions：指示文を除外し、上限を掛ける
     assert.ok(result.report.includes('絞った'), '切り詰めたことを planText に明示する')
   }
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑫ ジョブミラー：進捗が観測でき、job_kill が実行を止められる
+//    deep_research は前景実行なので、メインエージェントは完走まで何も見えない。
+//    DSH の正規の観測面（ジョブ）に workflow/* を写すことで、
+//    セッションヘッダのジョブ一覧が進捗をライブ表示し、job_kill が中止の入口になる。
+// ════════════════════════════════════════════════════════════════════════════
+test('⑫ ジョブミラー：進捗を写し、中止でき、必ず決着する', async () => {
+  const { mod } = await loadPlugin()
+
+  // (a) ジョブが正しい kind/label/owner で 1 つ作られ、jobId が戻る。
+  //     進捗イベント（phase / agent-*）が job に写る。
+  {
+    const { jobs, started } = stubJobs()
+    const stub = stubContext({ report: 'REPORT', review: undefined }, { deferResult: true, jobs })
+    mod.apply(stub.ctx, {})
+    const exec = stubExec(stub.ctx)
+    const pending = stubDefsExecute(stub, { topic: 'テスト主題', depth: 1, questions: '1. Q1' }, exec)
+
+    // run の起動直後（run.id 確定後）にイベントが来る、という実機の順序を再現する。
+    await Promise.resolve()
+    stub.emitWorkflow('workflow/phase', { id: 'run-1' }, '研究·第1轮')
+    stub.emitWorkflow('workflow/agent-start', { id: 'run-1' }, { seq: 1, label: '研究1·第1轮', phase: '研究·第1轮' })
+    stub.emitWorkflow('workflow/agent-end', { id: 'run-1' }, { seq: 1, outcome: 'completed' })
+
+    assert.strictEqual(started.length, 1, 'ジョブが 1 つ作られる')
+    const spec = started[0].spec
+    assert.strictEqual(spec.kind, 'deep-research', 'kind が deep-research')
+    assert.match(spec.label, /^deep_research: テスト主題/, 'label に主題が入る')
+    assert.strictEqual(spec.owner, 'parent', 'owner が呼び出し元エージェント')
+    assert.ok(spec.outputLimitBytes > 0, '出力リングを有界にする')
+
+    const handle = started[0].handle
+    assert.ok(handle.progress.includes('研究·第1轮'), 'phase が updateProgress に写る')
+    assert.ok(handle.appends.some((a) => a.text.includes('== 研究·第1轮 ==')), 'phase 見出しが append される')
+    assert.ok(handle.appends.some((a) => a.text.includes('研究1·第1轮') && a.text.includes('開始')), 'agent-start が append される')
+    assert.ok(handle.appends.some((a) => a.text.includes('#1') && a.text.includes('completed')), 'agent-end が append される')
+
+    // 完了でジョブが 'completed' に決着し、jobId が戻る。
+    stub.engineControl.resolve({ report: 'REPORT' })
+    const out = await pending
+    assert.strictEqual(out.ok, true)
+    assert.strictEqual(out.jobId, 'job-1', 'jobId が戻り値に入る')
+    const settled = await started[0].settled
+    assert.strictEqual(settled.status, 'completed', 'ジョブは completed で決着')
+    assert.ok(handle.progress.includes('完了'), '完了が進捗に出る')
+  }
+
+  // (b) job_kill 相当（hooks.cancel）が、エンジンに渡した signal を中断する。
+  {
+    const { jobs, started } = stubJobs()
+    const stub = stubContext({ report: 'R' }, { deferResult: true, jobs })
+    mod.apply(stub.ctx, {})
+    const pending = stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1' }, stubExec(stub.ctx))
+    await Promise.resolve()
+
+    const signal = stub.requests[0].signal
+    assert.strictEqual(signal.aborted, false, '開始時点では未中断')
+    started[0].hooks.cancel('やめて')
+    assert.strictEqual(signal.aborted, true, 'cancel() でエンジンの signal が中断される')
+
+    stub.engineControl.resolve(undefined, 'cancelled')
+    await assert.rejects(pending, /workflow run cancelled/, 'キャンセルはツールのエラーになる')
+    const settled = await started[0].settled
+    assert.strictEqual(settled.status, 'failed', 'ジョブは failed で決着（放置しない）')
+  }
+
+  // (c) 停止理由が completed でなければ、ジョブは failed で決着する。
+  {
+    const { jobs, started } = stubJobs()
+    const stub = stubContext({ report: 'R' }, { deferResult: true, jobs })
+    mod.apply(stub.ctx, {})
+    const pending = stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1' }, stubExec(stub.ctx))
+    await Promise.resolve()
+    stub.engineControl.resolve(undefined, 'error')
+    await assert.rejects(pending, /workflow run error/)
+    const settled = await started[0].settled
+    assert.strictEqual(settled.status, 'failed', 'error も failed として決着する')
+  }
+
+  // (d) jobs が無い構成では、ミラーせず従来どおり動く（jobId も付かない）。
+  {
+    const stub = stubContext({ report: 'R' })
+    mod.apply(stub.ctx, {})
+    const out = await stubDefsExecute(stub, { topic: 'T', depth: 1, questions: '1. Q1' }, stubExec(stub.ctx))
+    assert.strictEqual(out.ok, true, 'jobs 無しでも研究は成功する')
+    assert.ok(!('jobId' in out), 'jobs が無いときは jobId を付けない')
+    assert.strictEqual(stub.requests[0].signal.aborted, false, 'exec.signal をそのまま渡す')
+  }
+})
+
+/** stub の defs[0] を実行する（意図を明示するための小さな包み）。 */
+function stubDefsExecute(stub, args, exec) {
+  return stub.defs[0].execute(args, exec)
+}

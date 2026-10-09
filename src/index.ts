@@ -469,8 +469,83 @@ return {
 }
 `
 
+// ── 観測面（ジョブミラー） ───────────────────────────────────────────────────
+//
+// deep_research は前景で走るため、メインエージェントは完走まで何も見えません。
+// DSH には「非 tool-workflow 実行」の正規の観測面があり、job の出力リングに
+// 進捗を流すとセッションヘッダのジョブ一覧がライブで表示します。ここでは
+// workflow/* イベントを購読して job に写します（tool-workflow の
+// createWorkflowRecordMirror と同じ形。あちらが唯一の正準実装）。
+//
+// 購読は apply() でプラグインごとに 1 回だけ張り、runId → job の対応で
+// 自分の実行のイベントだけを拾います（イベント payload は run の同一性を
+// 持つので、他の実行のものは info.id で弾かれる）。
+
+/** `ctx.jobs` の、このプラグインが使う範囲だけを写した型（TS 依存を避ける）。 */
+interface JobHandleLike {
+  updateProgress(line: string): void
+  append(text: string, options?: { channel?: string }): void
+}
+interface JobOutcomeLike {
+  status: 'completed' | 'killed' | 'failed'
+  detail?: string
+  result?: string
+}
+interface JobSpecLike {
+  kind: string
+  label: string
+  owner?: string
+  outputLimitBytes?: number
+  run(job: JobHandleLike): { cancel(reason?: string): void; done: Promise<JobOutcomeLike> }
+}
+interface JobsServiceLike {
+  start(spec: JobSpecLike): string
+}
+
+/** 実行中の workflow run id → その run を映すジョブ。 */
+const runJobs = new Map<string, JobHandleLike>()
+
+function runIdOf(info: unknown): string {
+  const id = (info as { id?: unknown } | undefined)?.id
+  return typeof id === 'string' ? id : String(id ?? '')
+}
+
+/** workflow/* を購読してジョブに写す。apply() から 1 回だけ呼ぶ。 */
+function mirrorWorkflowIntoJobs(ctx: Context): void {
+  // イベント名の型（Context の `Events` 拡張）は @deepseek-ai/dsh-workflow が
+  // 提供するが、このチェックアウトは peer 依存を解決しないため見えない。
+  // 実行時は文字列で正しく動く（tool-workflow も同じ名前を使っている）。
+  const on = ctx.on as unknown as (
+    type: string,
+    handler: (...args: unknown[]) => void,
+  ) => void
+  on('workflow/phase', (info, title) => {
+    const job = runJobs.get(runIdOf(info))
+    if (job === undefined) return
+    job.updateProgress(String(title))
+    job.append('== ' + String(title) + ' ==\n')
+  })
+  on('workflow/log', (info, message) => {
+    runJobs.get(runIdOf(info))?.append(String(message) + '\n')
+  })
+  on('workflow/agent-start', (info, agent) => {
+    const job = runJobs.get(runIdOf(info))
+    if (job === undefined) return
+    const a = agent as { seq?: unknown; label?: unknown; phase?: unknown }
+    const label = a.label === undefined ? '' : String(a.label)
+    const phase = a.phase === undefined ? '' : String(a.phase) + ' - '
+    job.append('  > #' + String(a.seq) + ' ' + label + ' 開始\n')
+    job.updateProgress(phase + label)
+  })
+  on('workflow/agent-end', (info, agent) => {
+    const a = agent as { seq?: unknown; outcome?: unknown }
+    runJobs.get(runIdOf(info))?.append('  v #' + String(a.seq) + ' ' + String(a.outcome ?? '') + '\n')
+  })
+}
+
 /** Apply the plugin: register the `deep_research` tool on `ctx.tools`. */
 export function apply(ctx: Context, config: Config = {}) {
+  mirrorWorkflowIntoJobs(ctx)
   const subagentProvider = config.subagentProvider ?? undefined
   const plannerModel = config.plannerModel ?? undefined
   const researcherModel = config.researcherModel ?? undefined
@@ -551,6 +626,7 @@ export function apply(ctx: Context, config: Config = {}) {
           ok: { type: 'boolean', required: true },
           report: { type: 'string', required: true },
           review: { type: 'string' },
+          jobId: { type: 'string' },
         },
       },
       render: (_args, value) => [{
@@ -579,8 +655,46 @@ export function apply(ctx: Context, config: Config = {}) {
         throw new Error('deep_research requires an Agent preset with workflowEngine: mount this plugin inside the preset\'s `delegation` group (or another group sharing its `isolate: workflowEngine` realm), not on the host root')
       }
 
+      // 観測面: ジョブを 1 つ作り、進捗をそこへ流す。ジョブが無い構成では
+      // ミラーせず従来どおり動く（try/catch で握りつぶす）。ジョブは中止の
+      // 入口にもなる: job_kill → cancel() → controller.abort → run が cancelled。
+      const jobs = (parent.ctx.get('jobs') ?? ctx.get('jobs')) as JobsServiceLike | undefined
+      const controller = new AbortController()
+      let jobId: string | undefined
+      let job: JobHandleLike | undefined
+      let settleJob: ((outcome: JobOutcomeLike) => void) | undefined
+      const jobSettled = new Promise<JobOutcomeLike>((resolve) => { settleJob = resolve })
+
       const topic = String(args.topic).trim()
       if (topic.length === 0) throw new Error('deep_research: topic must not be empty')
+
+      // ジョブはトピック確定後に作る（label に使うため）。
+      if (jobs !== undefined && typeof parent.id === 'string' && parent.id.length > 0) {
+        try {
+          jobId = jobs.start({
+            kind: 'deep-research',
+            label: 'deep_research: ' + topic.slice(0, 60),
+            owner: String(parent.id),
+            outputLimitBytes: 1 << 20,
+            run: (handle) => {
+              job = handle
+              handle.updateProgress('開始')
+              return {
+                cancel: (reason) => { controller.abort(reason ?? 'deep_research cancelled') },
+                done: jobSettled,
+              }
+            },
+          })
+        } catch (error) {
+          // 観測できないだけで研究は続行する。ただし理由は残す（静かに殺すと
+          // 「なぜ進捗が見えないのか」が分からなくなる）。
+          jobId = undefined
+          job = undefined
+          const logger = (ctx as unknown as { logger?: { warn?: (m: string) => void } }).logger
+          logger?.warn?.('deep_research: job mirror unavailable (' + String(error) + '); research continues without progress reporting')
+        }
+      }
+
       const purpose = typeof args.purpose === 'string' && args.purpose.trim().length > 0
         ? args.purpose.trim()
         : undefined
@@ -639,27 +753,57 @@ export function apply(ctx: Context, config: Config = {}) {
         ...(subagentProvider !== undefined ? { subagentProvider } : {}),
         ...(maxTotalAgents !== undefined ? { maxTotalAgents } : {}),
         parent,
-        signal: exec.signal,
+        // job_kill も exec.signal（親のキャンセル）も、同じ run を止められるようにする。
+        // exec.signal が本物の AbortSignal でない場合は controller 側だけを使う
+        // （AbortSignal.any は AbortSignal 以外を受け取ると TypeError になる）。
+        signal: job === undefined
+          ? exec.signal
+          : (exec.signal instanceof AbortSignal
+            ? AbortSignal.any([exec.signal, controller.signal])
+            : controller.signal),
       })
 
+      // run.id は start() の戻りで確定し、phase などのイベントはこの後に来る。
+      // ここで対応づければ、自分の実行のイベントだけがジョブに入る。
+      if (job !== undefined) {
+        runJobs.set(String(run.id), job)
+        job.updateProgress('研究を開始')
+      }
+
       const result = await run.result
+      runJobs.delete(String(run.id))
       await run.dispose()
 
+      // `run.result` は reject しない（失敗は stopReason 'error'/'cancelled' として
+      // 解決する）ので、throw しうるのは以下の検証だけ。どの経路でもジョブを
+      // 決着させて、常駐したままのジョブを残さない。
+      const finishJob = (outcome: JobOutcomeLike): void => {
+        if (job === undefined) return
+        job.updateProgress(outcome.status === 'completed'
+          ? '完了'
+          : '終了: ' + String(outcome.detail ?? outcome.status))
+        if (settleJob !== undefined) settleJob(outcome)
+      }
       if (result.stopReason !== 'completed') {
+        finishJob({ status: 'failed', detail: String(result.stopReason) })
         throw new Error(`deep_research: workflow run ${result.stopReason}${result.error !== undefined ? ` (${result.error})` : ''}`)
       }
       const raw: unknown = result.value
       if (raw === null || typeof raw !== 'object') {
+        finishJob({ status: 'failed', detail: 'workflow returned no report' })
         throw new Error('deep_research: workflow returned no report')
       }
       const record = raw as Record<string, unknown>
       if (typeof record.report !== 'string') {
+        finishJob({ status: 'failed', detail: 'workflow returned no report' })
         throw new Error('deep_research: workflow returned no report')
       }
+      finishJob({ status: 'completed', result: '研究が完了しました（詳細はツール結果を参照）' })
       return {
         ok: true,
         report: record.report,
         ...(typeof record.review === 'string' ? { review: record.review } : {}),
+        ...(jobId !== undefined ? { jobId } : {}),
       }
     },
   }))
